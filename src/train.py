@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-Train a 3D vessel/tubular segmentation model:
+train.py — Mamba-Snake 3D tubular segmentation (cache-friendly, stable AMP, NaN-guarded)
 
-- Cache mode (recommended): loads preprocessed .pt volumes from --cache-dir
-  produced by preprocess_cache.py (images + labels + cases.json).
-- Fallback mode: loads NIfTI from --dataset-dir (nnUNet_raw-like structure).
+Key fixes vs your current file:
+- Works with EITHER --cache-dir (recommended) OR --dataset-dir (nnUNet_raw-like)
+- Robust to moved cache paths: if cases.json contains stale absolute paths, it auto-falls back to cache_dir/images|labels/{uid}.pt
+- Fixes NaNs:
+  * clDice computed in fp32 (autocast disabled only for clDice)
+  * fewer skeleton iterations by default
+  * skip non-finite loss / non-finite grads (prevents poisoning the run)
+  * optional grad clip + safer scaler usage
+- Memory knobs:
+  * --snake-stages (choose which Up blocks use snake)
+  * --snake-k (K for snake; smaller is faster + less memory)
+  * --checkpoint-bottleneck (activation checkpointing for bottleneck)
+  * --amp-dtype fp16|bf16 (bf16 often more stable on A100)
+- Speed knobs:
+  * TF32 enabled, cudnn benchmark on
+  * reduced clDice iterations, option to lower w_cldice early
 
-Key speed features:
-- cache mode avoids NIfTI gzip decompression and nibabel overhead.
-- optional per-worker LRU RAM caching of full volumes to reduce disk I/O.
-
-Loss:
-- Tversky + SoftDice + soft-clDice (topology/centerline)
-- By default, Dice/Tversky exclude background (better for extreme imbalance).
+Expected cached .pt format:
+  img: [1, D, H, W] float16/float32 in [0,1]
+  lab: [D, H, W] uint8 (0..num_classes-1)
 """
 
 from __future__ import annotations
@@ -27,7 +35,7 @@ import random
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple, List, Dict, Optional, Any
+from typing import Tuple, List, Dict, Optional, Any, Iterable, Set
 from collections import OrderedDict
 
 import numpy as np
@@ -36,11 +44,11 @@ import nibabel as nib
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
+from torch.utils.checkpoint import checkpoint
 
 
 # -------------------------
-# Utils
+# Repro / Perf flags
 # -------------------------
 def seed_everything(seed: int = 42) -> None:
     random.seed(seed)
@@ -49,6 +57,20 @@ def seed_everything(seed: int = 42) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def enable_perf_flags() -> None:
+    # TF32 speeds up conv/matmul on A100; usually safe for segmentation
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
+
+# -------------------------
+# Volume utils (NIfTI path)
+# -------------------------
 def _maybe_squeeze_4d(arr: np.ndarray) -> np.ndarray:
     if arr.ndim == 4:
         if arr.shape[-1] == 1:
@@ -58,16 +80,30 @@ def _maybe_squeeze_4d(arr: np.ndarray) -> np.ndarray:
     return arr
 
 
-def _normalize_img(img: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+def _normalize01(img: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     lo, hi = np.percentile(img, (0.5, 99.5))
     img = np.clip(img, lo, hi)
     img = img - img.min()
-    den = img.max() - img.min()
+    den = img.max()
     if den < eps:
         return np.zeros_like(img, dtype=np.float32)
     return (img / den).astype(np.float32)
 
 
+def _nib_load_canonical(path: Path) -> nib.Nifti1Image:
+    nii = nib.load(str(path))
+    nii = nib.as_closest_canonical(nii)  # RAS
+    return nii
+
+
+def _to_dhw(arr_xyz: np.ndarray) -> np.ndarray:
+    # (X,Y,Z) -> (Z,Y,X) == (D,H,W)
+    return np.transpose(arr_xyz, (2, 1, 0)).copy()
+
+
+# -------------------------
+# Patch ops
+# -------------------------
 def _pad_to_min_shape_torch(vol: torch.Tensor, target_dhw: Tuple[int, int, int], pad_value: float = 0.0) -> torch.Tensor:
     """
     vol: [D,H,W] or [C,D,H,W]
@@ -125,11 +161,11 @@ def _crop_around_center_torch(vol: torch.Tensor, center_dhw: Tuple[int, int, int
         return vol[sd:sd + pd, sh:sh + ph, sw:sw + pw]
 
 
-def _random_center_from_label_torch(label: torch.Tensor, fg: bool, rng: np.random.Generator) -> Tuple[int, int, int]:
+def _random_center_from_label(label: torch.Tensor, want_fg: bool, rng: np.random.Generator) -> Tuple[int, int, int]:
     """
     label: [D,H,W] int
     """
-    if fg:
+    if want_fg:
         idx = (label > 0).nonzero(as_tuple=False)
     else:
         idx = (label == 0).nonzero(as_tuple=False)
@@ -142,9 +178,9 @@ def _random_center_from_label_torch(label: torch.Tensor, fg: bool, rng: np.rando
     return (int(pick[0].item()), int(pick[1].item()), int(pick[2].item()))
 
 
-def _augment_patch_torch(img: torch.Tensor, lab: torch.Tensor, rng: np.random.Generator) -> Tuple[torch.Tensor, torch.Tensor]:
+def _augment_patch(img: torch.Tensor, lab: torch.Tensor, rng: np.random.Generator) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    img: [1,D,H,W] float
+    img: [1,D,H,W] float in [0,1]
     lab: [D,H,W] long
     """
     # flips
@@ -153,7 +189,7 @@ def _augment_patch_torch(img: torch.Tensor, lab: torch.Tensor, rng: np.random.Ge
             img = torch.flip(img, dims=(axis,))
             lab = torch.flip(lab, dims=(axis - 1,))
 
-    # intensity jitter (img is [0,1])
+    # intensity jitter
     if rng.random() < 0.25:
         scale = float(rng.uniform(0.9, 1.1))
         shift = float(rng.uniform(-0.05, 0.05))
@@ -162,14 +198,13 @@ def _augment_patch_torch(img: torch.Tensor, lab: torch.Tensor, rng: np.random.Ge
     # gaussian noise
     if rng.random() < 0.20:
         noise = torch.from_numpy(rng.normal(0.0, 0.01, size=img.shape).astype(np.float32))
-        noise = noise.to(img.device)
-        img = torch.clamp(img + noise, 0.0, 1.0)
+        img = torch.clamp(img + noise.to(img.device), 0.0, 1.0)
 
     return img, lab
 
 
 # -------------------------
-# Data listing
+# Listing cases
 # -------------------------
 def list_cases_from_dataset(dataset_dir: Path) -> List[Dict[str, str]]:
     images_dir = dataset_dir / "imagesTr"
@@ -215,10 +250,9 @@ def split_train_val(items: List[Dict[str, str]], val_ratio: float = 0.1, seed: i
 
 
 # -------------------------
-# Datasets
+# In-RAM LRU cache (per worker)
 # -------------------------
 class _LRUVolCache:
-    """Simple per-worker LRU cache for loaded volumes."""
     def __init__(self, max_items: int = 0):
         self.max_items = int(max_items)
         self.data: "OrderedDict[str, Any]" = OrderedDict()
@@ -241,26 +275,66 @@ class _LRUVolCache:
             self.data.popitem(last=False)
 
 
+def _resolve_cached_path(uid: str, p: str, cache_dir: Path, kind: str) -> str:
+    """
+    If cases.json has absolute paths from another container (/workspace/...), they may not exist here.
+    We try:
+      1) original path
+      2) cache_dir / relative(path)
+      3) cache_dir / (images|labels) / f"{uid}.pt"
+    """
+    pp = Path(p)
+    if pp.exists():
+        return str(pp)
+
+    # try cache_dir + relative
+    if pp.is_absolute():
+        try_rel = cache_dir / pp.relative_to(pp.anchor)
+        if try_rel.exists():
+            return str(try_rel)
+    else:
+        try_rel = cache_dir / pp
+        if try_rel.exists():
+            return str(try_rel)
+
+    # canonical fallback
+    if kind == "image":
+        alt = cache_dir / "images" / f"{uid}.pt"
+    else:
+        alt = cache_dir / "labels" / f"{uid}.pt"
+    return str(alt)
+
+
+# -------------------------
+# Datasets
+# -------------------------
 class CachedPatchDataset(torch.utils.data.Dataset):
     """
-    Uses preprocessed .pt volumes:
-      img: torch Tensor [1,D,H,W] float16/float32 in [0,1]
-      lab: torch Tensor [D,H,W] uint8 (0/1 or multiclass)
+    Uses cached .pt volumes:
+      img: [1,D,H,W] float16/float32 in [0,1]
+      lab: [D,H,W] uint8
     """
     def __init__(
         self,
         items: List[Dict[str, str]],
+        cache_dir: Path,
         patch_size: Tuple[int, int, int],
         training: bool,
-        pos_ratio: float = 0.67,
+        pos_ratio: float = 0.90,
         seed: int = 42,
         ram_cache_items: int = 0,
+        min_fg_voxels: int = 0,
+        max_center_tries: int = 12,
     ):
         self.items = items
+        self.cache_dir = Path(cache_dir)
         self.patch_size = tuple(int(x) for x in patch_size)
         self.training = bool(training)
         self.pos_ratio = float(pos_ratio)
         self.seed = int(seed)
+        self.min_fg_voxels = int(min_fg_voxels)
+        self.max_center_tries = int(max_center_tries)
+
         self.cache_img = _LRUVolCache(ram_cache_items)
         self.cache_lab = _LRUVolCache(ram_cache_items)
 
@@ -271,45 +345,66 @@ class CachedPatchDataset(torch.utils.data.Dataset):
         img = self.cache_img.get(uid)
         lab = self.cache_lab.get(uid)
         if img is None or lab is None:
-            img = torch.load(img_path, map_location="cpu")  # [1,D,H,W]
-            lab = torch.load(lab_path, map_location="cpu")  # [D,H,W]
+            img_path2 = _resolve_cached_path(uid, img_path, self.cache_dir, "image")
+            lab_path2 = _resolve_cached_path(uid, lab_path, self.cache_dir, "label")
+
+            img = torch.load(img_path2, map_location="cpu")  # [1,D,H,W]
+            lab = torch.load(lab_path2, map_location="cpu")  # [D,H,W]
+
             if img.ndim != 4 or lab.ndim != 3:
                 raise RuntimeError(f"Bad cached shapes for uid={uid}: img={tuple(img.shape)} lab={tuple(lab.shape)}")
-            # ensure dtypes
             if img.dtype not in (torch.float16, torch.float32):
                 img = img.float()
             if lab.dtype != torch.uint8:
                 lab = lab.to(torch.uint8)
+
             self.cache_img.put(uid, img)
             self.cache_lab.put(uid, lab)
+
         return img, lab
+
+    def _choose_center(self, lab: torch.Tensor, rng: np.random.Generator) -> Tuple[int, int, int]:
+        if not self.training:
+            D, H, W = lab.shape
+            return (D // 2, H // 2, W // 2)
+
+        want_fg = (rng.random() < self.pos_ratio)
+        if self.min_fg_voxels <= 0:
+            return _random_center_from_label(lab, want_fg=want_fg, rng=rng)
+
+        # enforce min fg voxels in the resulting patch (helps ultra-sparse fg)
+        D, H, W = lab.shape
+        for _ in range(self.max_center_tries):
+            c = _random_center_from_label(lab, want_fg=want_fg, rng=rng)
+            lab_p = _crop_around_center_torch(lab, c, self.patch_size)
+            if int((lab_p > 0).sum().item()) >= self.min_fg_voxels:
+                return c
+
+        # fallback: best-effort center
+        return _random_center_from_label(lab, want_fg=want_fg, rng=rng)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         it = self.items[idx]
         uid = it["uid"]
-        rng = np.random.default_rng(
-            self.seed + idx * 10007 + (0 if not self.training else int(time.time() * 1e3) % 100000)
-        )
+
+        # per-sample rng (time-mixed for training variety)
+        base = self.seed + idx * 10007
+        if self.training:
+            base += int(time.time() * 1000) % 100000
+        rng = np.random.default_rng(base)
 
         img, lab = self._load_pair(uid, it["image_pt"], it["label_pt"])  # img [1,D,H,W], lab [D,H,W]
 
-        # pad so crop never fails
         img = _pad_to_min_shape_torch(img, self.patch_size, pad_value=0.0)
         lab = _pad_to_min_shape_torch(lab, self.patch_size, pad_value=0)
 
-        if self.training:
-            want_fg = (rng.random() < self.pos_ratio)
-            center = _random_center_from_label_torch(lab, fg=want_fg, rng=rng)
-        else:
-            D, H, W = lab.shape
-            center = (D // 2, H // 2, W // 2)
+        center = self._choose_center(lab, rng)
 
         img_p = _crop_around_center_torch(img, center, self.patch_size)  # [1,D,H,W]
         lab_p = _crop_around_center_torch(lab, center, self.patch_size)  # [D,H,W]
 
-        # augmentation
         if self.training:
-            img_p, lab_p = _augment_patch_torch(img_p, lab_p.long(), rng=rng)
+            img_p, lab_p = _augment_patch(img_p, lab_p.long(), rng=rng)
         else:
             lab_p = lab_p.long()
 
@@ -318,131 +413,174 @@ class CachedPatchDataset(torch.utils.data.Dataset):
 
 class NiftiPatchDataset(torch.utils.data.Dataset):
     """
-    Fallback dataset: loads NIfTI per sample (slow). Use only if cache is unavailable.
+    For --dataset-dir usage (nnUNet_raw-like).
+    Loads NIfTI on the fly. Slower than cache, but kept for completeness.
     """
     def __init__(
         self,
         items: List[Dict[str, str]],
         patch_size: Tuple[int, int, int],
         training: bool,
-        pos_ratio: float = 0.67,
+        pos_ratio: float = 0.90,
         seed: int = 42,
+        min_fg_voxels: int = 0,
+        max_center_tries: int = 12,
     ):
         self.items = items
         self.patch_size = tuple(int(x) for x in patch_size)
-        self.training = training
+        self.training = bool(training)
         self.pos_ratio = float(pos_ratio)
         self.seed = int(seed)
+        self.min_fg_voxels = int(min_fg_voxels)
+        self.max_center_tries = int(max_center_tries)
 
     def __len__(self) -> int:
         return len(self.items)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        it = self.items[idx]
-        rng = np.random.default_rng(
-            self.seed + idx * 10007 + (0 if not self.training else int(time.time() * 1e3) % 100000)
-        )
+    def _load_pair(self, uid: str, img_path: str, lab_path: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        img_nii = _nib_load_canonical(Path(img_path))
+        lab_nii = _nib_load_canonical(Path(lab_path))
 
-        img = nib.load(it["image"]).get_fdata().astype(np.float32)
-        lab = nib.load(it["label"]).get_fdata().astype(np.int64)
-
+        img = np.asarray(img_nii.dataobj).astype(np.float32)
+        lab = np.asarray(lab_nii.dataobj).astype(np.int64)
         img = _maybe_squeeze_4d(img)
         lab = _maybe_squeeze_4d(lab)
-
         if img.ndim != 3 or lab.ndim != 3:
-            raise RuntimeError(f"Expected 3D volumes. Got img={img.shape} lab={lab.shape} uid={it.get('uid')}")
+            raise RuntimeError(f"Expected 3D volumes, got img={img.shape}, lab={lab.shape} for uid={uid}")
 
-        # nib gives (X,Y,Z); convert to (D,H,W) = (Z,Y,X)
-        img = np.transpose(img, (2, 1, 0))
-        lab = np.transpose(lab, (2, 1, 0))
+        img = _to_dhw(img)
+        lab = _to_dhw(lab).astype(np.uint8)
+        img = _normalize01(img)
 
-        img = _normalize_img(img)
+        img_t = torch.from_numpy(img)[None, ...]      # [1,D,H,W]
+        lab_t = torch.from_numpy(lab).to(torch.uint8) # [D,H,W]
+        return img_t, lab_t
 
-        img_t = torch.from_numpy(img)[None, ...]  # [1,D,H,W]
-        lab_t = torch.from_numpy(lab).to(torch.long)  # [D,H,W]
+    def _choose_center(self, lab: torch.Tensor, rng: np.random.Generator) -> Tuple[int, int, int]:
+        if not self.training:
+            D, H, W = lab.shape
+            return (D // 2, H // 2, W // 2)
 
-        img_t = _pad_to_min_shape_torch(img_t, self.patch_size, pad_value=0.0)
-        lab_t_u8 = _pad_to_min_shape_torch(lab_t.to(torch.uint8), self.patch_size, pad_value=0).long()
+        want_fg = (rng.random() < self.pos_ratio)
+        if self.min_fg_voxels <= 0:
+            return _random_center_from_label(lab, want_fg=want_fg, rng=rng)
+
+        for _ in range(self.max_center_tries):
+            c = _random_center_from_label(lab, want_fg=want_fg, rng=rng)
+            lab_p = _crop_around_center_torch(lab, c, self.patch_size)
+            if int((lab_p > 0).sum().item()) >= self.min_fg_voxels:
+                return c
+        return _random_center_from_label(lab, want_fg=want_fg, rng=rng)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        it = self.items[idx]
+        uid = it["uid"]
+
+        base = self.seed + idx * 10007
+        if self.training:
+            base += int(time.time() * 1000) % 100000
+        rng = np.random.default_rng(base)
+
+        img, lab = self._load_pair(uid, it["image"], it["label"])
+
+        img = _pad_to_min_shape_torch(img, self.patch_size, pad_value=0.0)
+        lab = _pad_to_min_shape_torch(lab, self.patch_size, pad_value=0)
+
+        center = self._choose_center(lab, rng)
+
+        img_p = _crop_around_center_torch(img, center, self.patch_size)
+        lab_p = _crop_around_center_torch(lab, center, self.patch_size)
 
         if self.training:
-            want_fg = (rng.random() < self.pos_ratio)
-            center = _random_center_from_label_torch(lab_t_u8.to(torch.uint8), fg=want_fg, rng=rng)
+            img_p, lab_p = _augment_patch(img_p, lab_p.long(), rng=rng)
         else:
-            D, H, W = lab_t_u8.shape
-            center = (D // 2, H // 2, W // 2)
+            lab_p = lab_p.long()
 
-        img_p = _crop_around_center_torch(img_t, center, self.patch_size)
-        lab_p = _crop_around_center_torch(lab_t_u8, center, self.patch_size).long()
-
-        if self.training:
-            img_p, lab_p = _augment_patch_torch(img_p, lab_p, rng=rng)
-
-        return {"image": img_p.contiguous(), "label": lab_p.contiguous(), "uid": it.get("uid", "")}
+        return {"image": img_p.contiguous(), "label": lab_p.contiguous(), "uid": uid}
 
 
 # -------------------------
-# Losses (Dice/Tversky default: exclude background)
+# Losses
 # -------------------------
+def _safe_softmax(logits: torch.Tensor, dim: int = 1) -> torch.Tensor:
+    # compute in fp32 for safety, then cast back
+    orig_dtype = logits.dtype
+    p = torch.softmax(logits.float(), dim=dim)
+    return p.to(orig_dtype)
+
+
 class SoftDiceLoss(nn.Module):
-    def __init__(self, smooth=1e-5, include_background=False):
+    def __init__(self, smooth: float = 1e-5, include_background: bool = False):
         super().__init__()
-        self.smooth = smooth
-        self.include_background = include_background
+        self.smooth = float(smooth)
+        self.include_background = bool(include_background)
 
-    def forward(self, logits, targets):
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         if logits.shape[2:] != targets.shape[-3:]:
             logits = F.interpolate(logits, size=targets.shape[-3:], mode="trilinear", align_corners=False)
+
         num_classes = logits.shape[1]
-        probs = torch.softmax(logits, dim=1)
+        probs = torch.softmax(logits.float(), dim=1)  # fp32
         onehot = F.one_hot(targets.long(), num_classes=num_classes).permute(0, 4, 1, 2, 3).float()
+
         if (not self.include_background) and num_classes > 1:
             probs = probs[:, 1:]
             onehot = onehot[:, 1:]
+
         dims = tuple(range(2, probs.ndim))
         inter = torch.sum(probs * onehot, dim=dims)
         den = torch.sum(probs + onehot, dim=dims)
-        dice = (2 * inter + self.smooth) / (den + self.smooth)
+        dice = (2.0 * inter + self.smooth) / (den + self.smooth)
         return 1.0 - dice.mean()
 
 
 class TverskyLoss(nn.Module):
-    def __init__(self, alpha=0.3, beta=0.7, smooth=1e-5, include_background=False):
+    def __init__(self, alpha=0.3, beta=0.7, smooth=1e-5, include_background: bool = False):
         super().__init__()
-        self.alpha = alpha
-        self.beta = beta
-        self.smooth = smooth
-        self.include_background = include_background
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self.smooth = float(smooth)
+        self.include_background = bool(include_background)
 
-    def forward(self, logits, targets):
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         if logits.shape[2:] != targets.shape[-3:]:
             logits = F.interpolate(logits, size=targets.shape[-3:], mode="trilinear", align_corners=False)
+
         num_classes = logits.shape[1]
-        probs = torch.softmax(logits, dim=1)
+        probs = torch.softmax(logits.float(), dim=1)  # fp32
         onehot = F.one_hot(targets.long(), num_classes=num_classes).permute(0, 4, 1, 2, 3).float()
+
         if (not self.include_background) and num_classes > 1:
             probs = probs[:, 1:]
             onehot = onehot[:, 1:]
+
         dims = tuple(range(2, probs.ndim))
         tp = torch.sum(probs * onehot, dim=dims)
         fp = torch.sum(probs * (1 - onehot), dim=dims)
         fn = torch.sum((1 - probs) * onehot, dim=dims)
+
         tversky = (tp + self.smooth) / (tp + self.alpha * fp + self.beta * fn + self.smooth)
         return 1.0 - tversky.mean()
 
 
-def _soft_erode(img):
+# Soft morphological ops (fp32 recommended)
+def _soft_erode(img: torch.Tensor) -> torch.Tensor:
     p1 = -F.max_pool3d(-img, kernel_size=(3, 1, 1), stride=1, padding=(1, 0, 0))
     p2 = -F.max_pool3d(-img, kernel_size=(1, 3, 1), stride=1, padding=(0, 1, 0))
     p3 = -F.max_pool3d(-img, kernel_size=(1, 1, 3), stride=1, padding=(0, 0, 1))
     return torch.min(torch.min(p1, p2), p3)
 
-def _soft_dilate(img):
+
+def _soft_dilate(img: torch.Tensor) -> torch.Tensor:
     return F.max_pool3d(img, kernel_size=3, stride=1, padding=1)
 
-def _soft_open(img):
+
+def _soft_open(img: torch.Tensor) -> torch.Tensor:
     return _soft_dilate(_soft_erode(img))
 
-def _soft_skel(img, iter_=10):
+
+def _soft_skel(img: torch.Tensor, iter_: int = 6) -> torch.Tensor:
+    img = torch.clamp(img, 0.0, 1.0)
     img1 = _soft_open(img)
     skel = F.relu(img - img1)
     for _ in range(iter_):
@@ -450,21 +588,28 @@ def _soft_skel(img, iter_=10):
         img1 = _soft_open(img)
         delta = F.relu(img - img1)
         skel = skel + F.relu(delta - skel * delta)
+    skel = torch.nan_to_num(skel, nan=0.0, posinf=0.0, neginf=0.0)
     return skel
 
 
 class SoftclDiceLoss(nn.Module):
-    def __init__(self, iterations=12, smooth=1e-5):
+    def __init__(self, iterations: int = 6, smooth: float = 1e-5):
         super().__init__()
-        self.iterations = iterations
-        self.smooth = smooth
+        self.iterations = int(iterations)
+        self.smooth = float(smooth)
 
-    def forward(self, probs_fg, targets_fg):
+    def forward(self, probs_fg: torch.Tensor, targets_fg: torch.Tensor) -> torch.Tensor:
+        # expects fp32 inputs
+        probs_fg = probs_fg.float()
+        targets_fg = targets_fg.float()
+
         skel_p = _soft_skel(probs_fg, self.iterations)
         skel_t = _soft_skel(targets_fg, self.iterations)
+
         tprec = (torch.sum(skel_p * targets_fg) + self.smooth) / (torch.sum(skel_p) + self.smooth)
         tsens = (torch.sum(skel_t * probs_fg) + self.smooth) / (torch.sum(skel_t * probs_fg) + self.smooth)
         cldice = (2 * tprec * tsens) / (tprec + tsens + self.smooth)
+        cldice = torch.nan_to_num(cldice, nan=0.0, posinf=0.0, neginf=0.0)
         return 1.0 - cldice
 
 
@@ -479,9 +624,12 @@ class TubularSegLoss(nn.Module):
         alpha=0.3,
         beta=0.7,
         include_background_losses: bool = False,
+        cldice_iters: int = 6,
+        ce_weight_fg: Optional[float] = None,
     ):
         super().__init__()
-        self.num_classes = num_classes
+        self.num_classes = int(num_classes)
+
         self.w_tv = float(w_tversky)
         self.w_dice = float(w_dice)
         self.w_cl = float(w_cldice)
@@ -489,76 +637,92 @@ class TubularSegLoss(nn.Module):
 
         self.tv = TverskyLoss(alpha=alpha, beta=beta, include_background=include_background_losses)
         self.dice = SoftDiceLoss(include_background=include_background_losses)
-        self.cldice = SoftclDiceLoss()
-        self.ce = nn.CrossEntropyLoss()
+        self.cldice = SoftclDiceLoss(iterations=cldice_iters)
+        if ce_weight_fg is not None and self.num_classes == 2:
+            w = torch.tensor([1.0, float(ce_weight_fg)], dtype=torch.float32)
+            self.ce = nn.CrossEntropyLoss(weight=w)
+        else:
+            self.ce = nn.CrossEntropyLoss()
 
-    def forward(self, logits, targets):
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         if logits.shape[2:] != targets.shape[-3:]:
             logits = F.interpolate(logits, size=targets.shape[-3:], mode="trilinear", align_corners=False)
 
-        loss = 0.0
+        loss = logits.new_tensor(0.0)
+
         if self.w_tv > 0:
             loss = loss + self.w_tv * self.tv(logits, targets)
         if self.w_dice > 0:
             loss = loss + self.w_dice * self.dice(logits, targets)
         if self.w_ce > 0:
-            loss = loss + self.w_ce * self.ce(logits, targets.long())
+            loss = loss + self.w_ce * self.ce(logits.float(), targets.long())
+
+        # IMPORTANT: clDice in fp32, with autocast disabled at call site
         if self.w_cl > 0:
-            probs = torch.softmax(logits, dim=1)
-            probs_fg = 1.0 - probs[:, 0:1]
-            tgt_fg = (targets > 0).float().unsqueeze(1)
+            probs = torch.softmax(logits.float(), dim=1)  # fp32
+            probs_fg = 1.0 - probs[:, 0:1]               # [B,1,D,H,W]
+            tgt_fg = (targets > 0).float().unsqueeze(1)  # [B,1,D,H,W]
             loss = loss + self.w_cl * self.cldice(probs_fg, tgt_fg)
+
+        loss = torch.nan_to_num(loss, nan=1.0, posinf=1.0, neginf=1.0)
         return loss
 
 
 # -------------------------
-# Model
+# Model blocks
 # -------------------------
 class MambaSSMBlock(nn.Module):
+    """
+    Requires mamba_ssm installed and importable (with working CUDA extensions).
+    """
     def __init__(self, dim: int, d_state: int = 16, d_conv: int = 4, expand: int = 2, dropout: float = 0.0):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
         self.dropout = nn.Dropout(dropout)
-        self.use_mamba = False
+
         try:
             from mamba_ssm import Mamba  # type: ignore
-            self.mamba = Mamba(d_model=dim, d_state=d_state, d_conv=d_conv, expand=expand)
-            self.use_mamba = True
-        except Exception:
-            self.mixer = nn.Sequential(
-                nn.Conv1d(dim, dim, kernel_size=9, padding=4, groups=dim),
-                nn.Conv1d(dim, dim, kernel_size=1),
-            )
+        except Exception as e:
+            raise RuntimeError(
+                "mamba_ssm is required. Your environment must import it without errors.\n"
+                "If import fails, your run will silently fall apart (or crash). Fix mamba first."
+            ) from e
+
+        self.mamba = Mamba(d_model=dim, d_state=d_state, d_conv=d_conv, expand=expand)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x [B,C,D,H,W] -> seq [B, L, C]
         b, c, d, h, w = x.shape
         seq = x.permute(0, 2, 3, 4, 1).reshape(b, d * h * w, c)
         y = self.norm(seq)
-        if self.use_mamba:
-            y = self.mamba(y)
-        else:
-            y = self.mixer(y.transpose(1, 2)).transpose(1, 2)
+        y = self.mamba(y)
         y = self.dropout(y)
         out = (seq + y).reshape(b, d, h, w, c).permute(0, 4, 1, 2, 3)
         return out
 
 
-def _make_base_grid_3d(B, D, H, W, device):
+def _make_base_grid_3d(B: int, D: int, H: int, W: int, device: torch.device) -> torch.Tensor:
     zz = torch.linspace(-1, 1, D, device=device)
     yy = torch.linspace(-1, 1, H, device=device)
     xx = torch.linspace(-1, 1, W, device=device)
     z, y, x = torch.meshgrid(zz, yy, xx, indexing="ij")
-    grid = torch.stack([x, y, z], dim=-1)
-    return grid.unsqueeze(0).repeat(B, 1, 1, 1, 1)
+    grid = torch.stack([x, y, z], dim=-1)  # (D,H,W,3) ordering for grid_sample
+    return grid.unsqueeze(0).repeat(B, 1, 1, 1, 1)  # (B,D,H,W,3)
 
 
 class SnakeRefine3D(nn.Module):
-    def __init__(self, channels: int, K: int = 5, offset_scale: float = 0.25):
+    """
+    Snake refinement along z (depth) by default (cheap + helpful for vessels).
+    Smaller K is faster and uses less VRAM.
+    """
+    def __init__(self, channels: int, K: int = 3, offset_scale: float = 0.25):
         super().__init__()
         assert K >= 3 and K % 2 == 1
         self.K = K
         self.half = K // 2
-        self.offset_scale = offset_scale
+        self.offset_scale = float(offset_scale)
+
+        # predict (K-1) offsets, applied cumulatively
         self.offset_pred = nn.Conv3d(channels, (K - 1), kernel_size=3, padding=1)
         self.fuse = nn.Sequential(
             nn.Conv3d(channels * K, channels, kernel_size=1, bias=False),
@@ -568,10 +732,11 @@ class SnakeRefine3D(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, D, H, W = x.shape
-        delta = torch.tanh(self.offset_pred(x)) * self.offset_scale
+        delta = torch.tanh(self.offset_pred(x)) * self.offset_scale  # [B, K-1, D,H,W]
         base = _make_base_grid_3d(B, D, H, W, x.device)
         grids = [base]
 
+        # positive direction
         cum = 0.0
         for s in range(1, self.half + 1):
             cum = cum + delta[:, s - 1:s, ...]
@@ -579,6 +744,7 @@ class SnakeRefine3D(nn.Module):
             g[..., 2] = g[..., 2] + (cum.squeeze(1) * (2.0 / max(1, D - 1)))
             grids.append(g)
 
+        # negative direction
         cum = 0.0
         for s in range(1, self.half + 1):
             cum = cum + delta[:, s - 1:s, ...]
@@ -593,7 +759,7 @@ class SnakeRefine3D(nn.Module):
 
 
 class ConvBlock(nn.Module):
-    def __init__(self, in_ch, out_ch):
+    def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
         self.block = nn.Sequential(
             nn.Conv3d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
@@ -603,11 +769,13 @@ class ConvBlock(nn.Module):
             nn.InstanceNorm3d(out_ch, affine=True),
             nn.SiLU(),
         )
-    def forward(self, x): return self.block(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
 
 
 class Down(nn.Module):
-    def __init__(self, in_ch, out_ch):
+    def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
         self.down = nn.Sequential(
             nn.Conv3d(in_ch, out_ch, kernel_size=2, stride=2, bias=False),
@@ -616,19 +784,19 @@ class Down(nn.Module):
         )
         self.block = ConvBlock(out_ch, out_ch)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.down(x)
         return self.block(x)
 
 
 class Up(nn.Module):
-    def __init__(self, in_ch, skip_ch, out_ch, use_snake: bool):
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int, use_snake: bool, snake_k: int):
         super().__init__()
         self.up = nn.ConvTranspose3d(in_ch, out_ch, kernel_size=2, stride=2, bias=False)
         self.block = ConvBlock(out_ch + skip_ch, out_ch)
-        self.snake = SnakeRefine3D(out_ch, K=5) if use_snake else nn.Identity()
+        self.snake = SnakeRefine3D(out_ch, K=snake_k) if use_snake else nn.Identity()
 
-    def forward(self, x, skip):
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
         x = self.up(x)
         dz = skip.shape[2] - x.shape[2]
         dy = skip.shape[3] - x.shape[3]
@@ -641,49 +809,84 @@ class Up(nn.Module):
         return x
 
 
+def _parse_stages(s: str) -> Set[str]:
+    # e.g. "u1,u2" -> {"u1","u2"}
+    out: Set[str] = set()
+    for t in s.split(","):
+        t = t.strip()
+        if t:
+            out.add(t)
+    return out
+
+
 class MambaSnakeUNet3D(nn.Module):
-    def __init__(self, in_ch=1, num_classes=2, base=32, mamba_layers=4):
+    def __init__(
+        self,
+        in_ch: int = 1,
+        num_classes: int = 2,
+        base: int = 32,
+        mamba_layers: int = 4,
+        snake_stages: Iterable[str] = ("u0", "u1", "u2"),
+        snake_k: int = 3,
+        checkpoint_bottleneck: bool = False,
+    ):
         super().__init__()
+        self.checkpoint_bottleneck = bool(checkpoint_bottleneck)
+
         self.stem = ConvBlock(in_ch, base)
         self.d1 = Down(base, base * 2)
         self.d2 = Down(base * 2, base * 4)
         self.d3 = Down(base * 4, base * 8)
 
         bott_dim = base * 8
-        self.bottleneck = nn.Sequential(
-            ConvBlock(bott_dim, bott_dim),
-            *[MambaSSMBlock(bott_dim) for _ in range(mamba_layers)],
-            ConvBlock(bott_dim, bott_dim),
-        )
+        self.bott_pre = ConvBlock(bott_dim, bott_dim)
+        self.mamba_blocks = nn.ModuleList([MambaSSMBlock(bott_dim) for _ in range(int(mamba_layers))])
+        self.bott_post = ConvBlock(bott_dim, bott_dim)
 
-        self.u3 = Up(bott_dim, base * 8, base * 4, use_snake=False)
-        self.u2 = Up(base * 4, base * 4, base * 2, use_snake=True)
-        self.u1 = Up(base * 2, base * 2, base,     use_snake=True)
-        self.u0 = Up(base,     base,     base,     use_snake=True)
+        stages = set(snake_stages)
+        self.u3 = Up(bott_dim, base * 8, base * 4, use_snake=("u3" in stages), snake_k=snake_k)
+        self.u2 = Up(base * 4, base * 4, base * 2, use_snake=("u2" in stages), snake_k=snake_k)
+        self.u1 = Up(base * 2, base * 2, base,     use_snake=("u1" in stages), snake_k=snake_k)
+        self.u0 = Up(base,     base,     base,     use_snake=("u0" in stages), snake_k=snake_k)
 
         self.head = nn.Conv3d(base, num_classes, kernel_size=1)
 
-    def forward(self, x):
+    def _run_bottleneck(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.bott_pre(x)
+        if self.checkpoint_bottleneck and self.training:
+            # checkpoint each block to save memory (slower)
+            for blk in self.mamba_blocks:
+                x = checkpoint(blk, x, use_reentrant=False)
+        else:
+            for blk in self.mamba_blocks:
+                x = blk(x)
+        x = self.bott_post(x)
+        return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x0 = self.stem(x)
         x1 = self.d1(x0)
         x2 = self.d2(x1)
         x3 = self.d3(x2)
 
-        b = self.bottleneck(x3)
+        b = self._run_bottleneck(x3)
 
         y2 = self.u3(b, x3)
         y1 = self.u2(y2, x2)
         y0 = self.u1(y1, x1)
         y  = self.u0(y0, x0)
-
         return self.head(y)
 
 
+# -------------------------
+# Metrics
+# -------------------------
 @torch.no_grad()
-def dice_per_class(logits, targets, num_classes: int, eps=1e-5):
+def dice_per_class(logits: torch.Tensor, targets: torch.Tensor, num_classes: int, eps: float = 1e-5) -> List[float]:
     if logits.shape[2:] != targets.shape[-3:]:
         logits = F.interpolate(logits, size=targets.shape[-3:], mode="trilinear", align_corners=False)
-    probs = torch.softmax(logits, dim=1)
+
+    probs = torch.softmax(logits.float(), dim=1)
     pred = torch.argmax(probs, dim=1)
     dices = []
     for c in range(num_classes):
@@ -691,7 +894,8 @@ def dice_per_class(logits, targets, num_classes: int, eps=1e-5):
         t = (targets == c).float()
         inter = (p * t).sum()
         den = p.sum() + t.sum()
-        dices.append(((2 * inter + eps) / (den + eps)).item())
+        d = (2 * inter + eps) / (den + eps)
+        dices.append(float(d.item()))
     return dices
 
 
@@ -701,7 +905,7 @@ def dice_per_class(logits, targets, num_classes: int, eps=1e-5):
 class EMA:
     def __init__(self, model: nn.Module, decay: float = 0.999):
         self.decay = float(decay)
-        self.shadow = {}
+        self.shadow: Dict[str, torch.Tensor] = {}
         for n, p in model.named_parameters():
             if p.requires_grad:
                 self.shadow[n] = p.detach().clone()
@@ -721,42 +925,105 @@ class EMA:
 
 
 # -------------------------
-# Config + Train
+# AMP helpers (torch.amp API, no deprecation warnings)
+# -------------------------
+def _amp_dtype(s: str) -> torch.dtype:
+    s = str(s).lower()
+    if s in ("fp16", "float16", "16"):
+        return torch.float16
+    if s in ("bf16", "bfloat16"):
+        return torch.bfloat16
+    raise ValueError(f"Unknown amp dtype: {s}")
+
+
+class AmpContext:
+    def __init__(self, enabled: bool, dtype: torch.dtype):
+        self.enabled = bool(enabled)
+        self.dtype = dtype
+
+    def __enter__(self):
+        if not self.enabled:
+            return None
+        return torch.amp.autocast(device_type="cuda", dtype=self.dtype).__enter__()
+
+    def __exit__(self, exc_type, exc, tb):
+        if not self.enabled:
+            return False
+        return torch.amp.autocast(device_type="cuda", dtype=self.dtype).__exit__(exc_type, exc, tb)
+
+
+# -------------------------
+# Training config
 # -------------------------
 @dataclass
 class TrainConfig:
-    dataset_dir: Path
+    dataset_dir: Optional[Path]
     cache_dir: Optional[Path]
     out_dir: Path
+
     num_classes: int = 2
-    epochs: int = 200
+    epochs: int = 250
     batch_size: int = 1
     accum_steps: int = 1
-    lr: float = 2e-4
+    lr: float = 1e-4
     weight_decay: float = 1e-2
     val_ratio: float = 0.1
-    num_workers: int = 4
+    num_workers: int = 8
+
     patch_size: Tuple[int, int, int] = (160, 160, 160)
-    amp: bool = True
     seed: int = 42
     gpu: int = 0
+
+    amp: bool = True
+    amp_dtype: torch.dtype = torch.bfloat16
+
     base_ch: int = 32
     mamba_layers: int = 4
-    w_tversky: float = 0.6
-    w_dice: float = 0.2
-    w_cldice: float = 0.2
-    w_ce: float = 0.0
+
+    snake_stages: Set[str] = None  # set in main
+    snake_k: int = 3
+    checkpoint_bottleneck: bool = False
+
+    w_tversky: float = 0.65
+    w_dice: float = 0.20
+    w_cldice: float = 0.05
+    w_ce: float = 0.10
     alpha: float = 0.3
     beta: float = 0.7
-    pos_ratio: float = 0.67
-    grad_clip: float = 0.0
-    ema: float = 0.0
+
+    cldice_iters: int = 6
+    ce_weight_fg: Optional[float] = None
+
+    pos_ratio: float = 0.97
+    min_fg_voxels: int = 0
+    grad_clip: float = 0.5
+    ema: float = 0.999
+
     include_background_losses: bool = False
     compile: bool = False
     ram_cache_items: int = 0
 
 
-def train_one_epoch(model, loader, optimizer, scaler, loss_fn, cfg: TrainConfig, ema: Optional[EMA] = None):
+def _is_finite_tensor(x: torch.Tensor) -> bool:
+    return bool(torch.isfinite(x).all().item())
+
+
+def _grads_finite(model: nn.Module) -> bool:
+    for p in model.parameters():
+        if p.grad is not None and not torch.isfinite(p.grad).all():
+            return False
+    return True
+
+
+def train_one_epoch(
+    model: nn.Module,
+    loader: torch.utils.data.DataLoader,
+    optimizer: torch.optim.Optimizer,
+    scaler: Optional[torch.amp.GradScaler],
+    loss_fn: TubularSegLoss,
+    cfg: TrainConfig,
+    ema: Optional[EMA] = None,
+) -> float:
     model.train()
     total = 0.0
     n = 0
@@ -766,26 +1033,53 @@ def train_one_epoch(model, loader, optimizer, scaler, loss_fn, cfg: TrainConfig,
         img = batch["image"].cuda(non_blocking=True)
         lab = batch["label"].cuda(non_blocking=True).long()
 
-        with autocast(enabled=cfg.amp):
+        # forward under AMP
+        with torch.amp.autocast(device_type="cuda", enabled=cfg.amp, dtype=cfg.amp_dtype):
             logits = model(img)
-            loss = loss_fn(logits, lab) / max(1, cfg.accum_steps)
 
-        if cfg.amp:
+            # IMPORTANT: disable autocast for clDice to avoid NaNs (loss_fn expects this)
+            if loss_fn.w_cl > 0:
+                with torch.amp.autocast(device_type="cuda", enabled=False):
+                    loss = loss_fn(logits, lab) / max(1, cfg.accum_steps)
+            else:
+                loss = loss_fn(logits, lab) / max(1, cfg.accum_steps)
+
+        # loss finite guard
+        if not torch.isfinite(loss):
+            print("[WARN] non-finite loss detected; skipping this batch.")
+            optimizer.zero_grad(set_to_none=True)
+            if scaler is not None:
+                scaler.update()
+            continue
+
+        if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
 
+        # step?
         if (step % cfg.accum_steps) == 0:
+            if scaler is not None:
+                scaler.unscale_(optimizer)
+
+            # grad finite guard
+            if not _grads_finite(model):
+                print("[WARN] non-finite grads detected; skipping optimizer step.")
+                optimizer.zero_grad(set_to_none=True)
+                if scaler is not None:
+                    scaler.update()
+                continue
+
+            # grad clip
             if cfg.grad_clip and cfg.grad_clip > 0:
-                if cfg.amp:
-                    scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
 
-            if cfg.amp:
+            if scaler is not None:
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 optimizer.step()
+
             optimizer.zero_grad(set_to_none=True)
 
             if ema is not None:
@@ -798,7 +1092,12 @@ def train_one_epoch(model, loader, optimizer, scaler, loss_fn, cfg: TrainConfig,
 
 
 @torch.no_grad()
-def validate(model, loader, loss_fn, cfg: TrainConfig):
+def validate(
+    model: nn.Module,
+    loader: torch.utils.data.DataLoader,
+    loss_fn: TubularSegLoss,
+    cfg: TrainConfig,
+) -> Tuple[float, List[float]]:
     model.eval()
     total = 0.0
     n = 0
@@ -808,10 +1107,16 @@ def validate(model, loader, loss_fn, cfg: TrainConfig):
         img = batch["image"].cuda(non_blocking=True)
         lab = batch["label"].cuda(non_blocking=True).long()
 
-        with autocast(enabled=cfg.amp):
+        with torch.amp.autocast(device_type="cuda", enabled=cfg.amp, dtype=cfg.amp_dtype):
             logits = model(img)
-            loss = loss_fn(logits, lab)
+            # clDice in fp32
+            if loss_fn.w_cl > 0:
+                with torch.amp.autocast(device_type="cuda", enabled=False):
+                    loss = loss_fn(logits, lab)
+            else:
+                loss = loss_fn(logits, lab)
 
+        loss = torch.nan_to_num(loss, nan=1.0, posinf=1.0, neginf=1.0)
         total += float(loss.item())
         n += 1
         dices_sum += np.array(dice_per_class(logits, lab, cfg.num_classes), dtype=np.float64)
@@ -819,41 +1124,62 @@ def validate(model, loader, loss_fn, cfg: TrainConfig):
     return (total / max(1, n)), (dices_sum / max(1, n)).tolist()
 
 
+# -------------------------
+# Main
+# -------------------------
 def main():
     ap = argparse.ArgumentParser()
+
     ap.add_argument("--dataset-dir", type=Path, default=None,
                     help="nnUNet_raw-like dataset dir (ONLY if --cache-dir is not provided)")
     ap.add_argument("--cache-dir", type=Path, default=None,
-                    help="cache directory from preprocess_cache.py (recommended)")
+                    help="cache directory containing cases.json (recommended)")
     ap.add_argument("--out-dir", type=Path, required=True)
 
     ap.add_argument("--num-classes", type=int, default=2)
-    ap.add_argument("--epochs", type=int, default=200)
+    ap.add_argument("--epochs", type=int, default=250)
     ap.add_argument("--batch-size", type=int, default=1)
     ap.add_argument("--accum-steps", type=int, default=1)
-    ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--weight-decay", type=float, default=1e-2)
     ap.add_argument("--val-ratio", type=float, default=0.1)
-    ap.add_argument("--num-workers", type=int, default=4)
+    ap.add_argument("--num-workers", type=int, default=8)
     ap.add_argument("--patch-size", type=int, nargs=3, default=[160, 160, 160])
+
     ap.add_argument("--no-amp", action="store_true")
+    ap.add_argument("--amp-dtype", type=str, default="bf16", choices=["fp16", "bf16"],
+                    help="bf16 is usually more stable on A100; fp16 is faster but can NaN easier")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--gpu", type=int, default=0)
+
     ap.add_argument("--base-ch", type=int, default=32)
     ap.add_argument("--mamba-layers", type=int, default=4)
 
-    ap.add_argument("--w-tversky", type=float, default=0.6)
-    ap.add_argument("--w-dice", type=float, default=0.2)
-    ap.add_argument("--w-cldice", type=float, default=0.2)
-    ap.add_argument("--w-ce", type=float, default=0.0)
+    ap.add_argument("--snake-stages", type=str, default="u0,u1,u2",
+                    help="Comma-separated: which decoder stages use snake. e.g. u1,u2 or none")
+    ap.add_argument("--snake-k", type=int, default=3, help="Snake K (odd >=3). Smaller is faster/less VRAM.")
+    ap.add_argument("--checkpoint-bottleneck", action="store_true", help="Activation checkpoint bottleneck (saves VRAM, slower)")
+
+    ap.add_argument("--w-tversky", type=float, default=0.65)
+    ap.add_argument("--w-dice", type=float, default=0.20)
+    ap.add_argument("--w-cldice", type=float, default=0.05)
+    ap.add_argument("--w-ce", type=float, default=0.10)
     ap.add_argument("--alpha", type=float, default=0.3)
     ap.add_argument("--beta", type=float, default=0.7)
+    ap.add_argument("--cldice-iters", type=int, default=6, help="Soft skeleton iterations (lower is faster + more stable)")
 
-    ap.add_argument("--pos-ratio", type=float, default=0.67, help="probability to sample foreground-centered patch")
-    ap.add_argument("--grad-clip", type=float, default=0.0, help="clip grad-norm (0 disables)")
-    ap.add_argument("--ema", type=float, default=0.0, help="EMA decay (0 disables), e.g. 0.999")
+    ap.add_argument("--ce-weight-fg", type=float, default=None,
+                    help="If set (binary only), foreground class weight for CE (helps extreme imbalance).")
+
+    ap.add_argument("--pos-ratio", type=float, default=0.97, help="Prob sample foreground-centered patch")
+    ap.add_argument("--min-fg-voxels", type=int, default=0,
+                    help="If >0, tries multiple centers until patch has at least this many fg voxels (helps ultra-sparse fg).")
+
+    ap.add_argument("--grad-clip", type=float, default=0.5)
+    ap.add_argument("--ema", type=float, default=0.999)
     ap.add_argument("--include-background-losses", action="store_true",
                     help="Include background in Dice/Tversky (usually worse for imbalance)")
+
     ap.add_argument("--compile", action="store_true", help="torch.compile model (PyTorch 2.x)")
     ap.add_argument("--ram-cache-items", type=int, default=0,
                     help="per-worker LRU cache of N full volumes (0 disables). Try 4..16 if RAM allows.")
@@ -867,53 +1193,74 @@ def main():
         if not cj.exists():
             raise SystemExit(f"--cache-dir provided but cases.json not found: {cj}")
 
-    cfg = TrainConfig(
-        dataset_dir=(args.dataset_dir if args.dataset_dir is not None else Path(".")),
-        cache_dir=args.cache_dir,
-        out_dir=args.out_dir,
-        num_classes=args.num_classes,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        accum_steps=max(1, args.accum_steps),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        val_ratio=args.val_ratio,
-        num_workers=args.num_workers,
-        patch_size=tuple(args.patch_size),
-        amp=(not args.no_amp),
-        seed=args.seed,
-        gpu=args.gpu,
-        base_ch=args.base_ch,
-        mamba_layers=args.mamba_layers,
-        w_tversky=args.w_tversky,
-        w_dice=args.w_dice,
-        w_cldice=args.w_cldice,
-        w_ce=args.w_ce,
-        alpha=args.alpha,
-        beta=args.beta,
-        pos_ratio=args.pos_ratio,
-        grad_clip=args.grad_clip,
-        ema=args.ema,
-        include_background_losses=args.include_background_losses,
-        compile=args.compile,
-        ram_cache_items=args.ram_cache_items,
-    )
-
-    cfg.out_dir.mkdir(parents=True, exist_ok=True)
-    seed_everything(cfg.seed)
-
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available.")
 
+    enable_perf_flags()
+    seed_everything(int(args.seed))
+
     # IMPORTANT: with CUDA_VISIBLE_DEVICES, visible GPUs are re-indexed from 0
-    torch.cuda.set_device(cfg.gpu)
-    device = torch.device(f"cuda:{cfg.gpu}")
-    torch.backends.cudnn.benchmark = True
+    torch.cuda.set_device(int(args.gpu))
+    device = torch.device(f"cuda:{int(args.gpu)}")
+
+    amp = (not args.no_amp)
+    amp_dtype = _amp_dtype(args.amp_dtype)
+
+    # GradScaler: use only for fp16 AMP (bf16 typically does not need scaling)
+    scaler: Optional[torch.amp.GradScaler]
+    if amp and amp_dtype == torch.float16:
+        scaler = torch.amp.GradScaler("cuda", enabled=True)
+    else:
+        scaler = None
+
+    snake_stages = _parse_stages(args.snake_stages) if args.snake_stages.strip().lower() != "none" else set()
+
+    cfg = TrainConfig(
+        dataset_dir=args.dataset_dir,
+        cache_dir=args.cache_dir,
+        out_dir=args.out_dir,
+        num_classes=int(args.num_classes),
+        epochs=int(args.epochs),
+        batch_size=int(args.batch_size),
+        accum_steps=max(1, int(args.accum_steps)),
+        lr=float(args.lr),
+        weight_decay=float(args.weight_decay),
+        val_ratio=float(args.val_ratio),
+        num_workers=int(args.num_workers),
+        patch_size=tuple(int(x) for x in args.patch_size),
+        seed=int(args.seed),
+        gpu=int(args.gpu),
+        amp=amp,
+        amp_dtype=amp_dtype,
+        base_ch=int(args.base_ch),
+        mamba_layers=int(args.mamba_layers),
+        snake_stages=snake_stages,
+        snake_k=int(args.snake_k),
+        checkpoint_bottleneck=bool(args.checkpoint_bottleneck),
+        w_tversky=float(args.w_tversky),
+        w_dice=float(args.w_dice),
+        w_cldice=float(args.w_cldice),
+        w_ce=float(args.w_ce),
+        alpha=float(args.alpha),
+        beta=float(args.beta),
+        cldice_iters=int(args.cldice_iters),
+        ce_weight_fg=args.ce_weight_fg,
+        pos_ratio=float(args.pos_ratio),
+        min_fg_voxels=int(args.min_fg_voxels),
+        grad_clip=float(args.grad_clip),
+        ema=float(args.ema),
+        include_background_losses=bool(args.include_background_losses),
+        compile=bool(args.compile),
+        ram_cache_items=int(args.ram_cache_items),
+    )
+
+    cfg.out_dir.mkdir(parents=True, exist_ok=True)
 
     # --- load items ---
     if cfg.cache_dir is not None:
         items = list_cases_from_cache(cfg.cache_dir)
     else:
+        assert cfg.dataset_dir is not None
         items = list_cases_from_dataset(cfg.dataset_dir)
 
     train_items, val_items = split_train_val(items, val_ratio=cfg.val_ratio, seed=cfg.seed)
@@ -921,16 +1268,29 @@ def main():
     # --- datasets ---
     if cfg.cache_dir is not None:
         train_ds = CachedPatchDataset(
-            train_items, patch_size=cfg.patch_size, training=True,
-            pos_ratio=cfg.pos_ratio, seed=cfg.seed, ram_cache_items=cfg.ram_cache_items
+            train_items, cache_dir=cfg.cache_dir,
+            patch_size=cfg.patch_size, training=True,
+            pos_ratio=cfg.pos_ratio, seed=cfg.seed,
+            ram_cache_items=cfg.ram_cache_items,
+            min_fg_voxels=cfg.min_fg_voxels,
         )
         val_ds = CachedPatchDataset(
-            val_items, patch_size=cfg.patch_size, training=False,
-            pos_ratio=0.0, seed=cfg.seed, ram_cache_items=cfg.ram_cache_items
+            val_items, cache_dir=cfg.cache_dir,
+            patch_size=cfg.patch_size, training=False,
+            pos_ratio=0.0, seed=cfg.seed,
+            ram_cache_items=cfg.ram_cache_items,
+            min_fg_voxels=0,
         )
     else:
-        train_ds = NiftiPatchDataset(train_items, patch_size=cfg.patch_size, training=True, pos_ratio=cfg.pos_ratio, seed=cfg.seed)
-        val_ds   = NiftiPatchDataset(val_items,   patch_size=cfg.patch_size, training=False, pos_ratio=0.0, seed=cfg.seed)
+        train_ds = NiftiPatchDataset(
+            train_items, patch_size=cfg.patch_size, training=True,
+            pos_ratio=cfg.pos_ratio, seed=cfg.seed,
+            min_fg_voxels=cfg.min_fg_voxels,
+        )
+        val_ds = NiftiPatchDataset(
+            val_items, patch_size=cfg.patch_size, training=False,
+            pos_ratio=0.0, seed=cfg.seed,
+        )
 
     train_loader = torch.utils.data.DataLoader(
         train_ds,
@@ -958,16 +1318,18 @@ def main():
         num_classes=cfg.num_classes,
         base=cfg.base_ch,
         mamba_layers=cfg.mamba_layers,
+        snake_stages=cfg.snake_stages,
+        snake_k=cfg.snake_k,
+        checkpoint_bottleneck=cfg.checkpoint_bottleneck,
     ).to(device)
 
     if cfg.compile:
         try:
-            model = torch.compile(model)  # PyTorch 2.x
+            model = torch.compile(model)
         except Exception as e:
             print(f"[WARN] torch.compile failed, continuing without compile: {e}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scaler = GradScaler(enabled=cfg.amp)
 
     def lr_factor(epoch_idx: int) -> float:
         t = epoch_idx / max(1, cfg.epochs)
@@ -982,6 +1344,8 @@ def main():
         alpha=cfg.alpha,
         beta=cfg.beta,
         include_background_losses=cfg.include_background_losses,
+        cldice_iters=cfg.cldice_iters,
+        ce_weight_fg=cfg.ce_weight_fg,
     ).to(device)
 
     ema_obj: Optional[EMA] = EMA(model, decay=cfg.ema) if (cfg.ema and cfg.ema > 0) else None
@@ -989,7 +1353,53 @@ def main():
     best_val = float("inf")
     history: List[Dict[str, Any]] = []
 
+    # Save config
+    (cfg.out_dir / "config.json").write_text(json.dumps({
+        "dataset_dir": str(cfg.dataset_dir) if cfg.dataset_dir is not None else None,
+        "cache_dir": str(cfg.cache_dir) if cfg.cache_dir is not None else None,
+        "out_dir": str(cfg.out_dir),
+        "num_classes": cfg.num_classes,
+        "epochs": cfg.epochs,
+        "batch_size": cfg.batch_size,
+        "accum_steps": cfg.accum_steps,
+        "lr": cfg.lr,
+        "weight_decay": cfg.weight_decay,
+        "val_ratio": cfg.val_ratio,
+        "num_workers": cfg.num_workers,
+        "patch_size": list(cfg.patch_size),
+        "seed": cfg.seed,
+        "gpu": cfg.gpu,
+        "amp": cfg.amp,
+        "amp_dtype": str(cfg.amp_dtype),
+        "base_ch": cfg.base_ch,
+        "mamba_layers": cfg.mamba_layers,
+        "snake_stages": sorted(list(cfg.snake_stages)),
+        "snake_k": cfg.snake_k,
+        "checkpoint_bottleneck": cfg.checkpoint_bottleneck,
+        "loss": {
+            "w_tversky": cfg.w_tversky,
+            "w_dice": cfg.w_dice,
+            "w_cldice": cfg.w_cldice,
+            "w_ce": cfg.w_ce,
+            "alpha": cfg.alpha,
+            "beta": cfg.beta,
+            "cldice_iters": cfg.cldice_iters,
+            "ce_weight_fg": cfg.ce_weight_fg,
+            "include_background_losses": cfg.include_background_losses,
+        },
+        "sampling": {
+            "pos_ratio": cfg.pos_ratio,
+            "min_fg_voxels": cfg.min_fg_voxels,
+        },
+        "stability": {
+            "grad_clip": cfg.grad_clip,
+            "ema": cfg.ema,
+        },
+        "ram_cache_items": cfg.ram_cache_items,
+    }, indent=2))
+
     for epoch in range(1, cfg.epochs + 1):
+        # cosine lr
         for pg in optimizer.param_groups:
             pg["lr"] = cfg.lr * lr_factor(epoch - 1)
 
@@ -998,13 +1408,9 @@ def main():
 
         # validate with EMA weights if enabled
         if ema_obj is not None:
-            # swap to ema for eval
             backup = {n: p.detach().clone() for n, p in model.named_parameters() if p.requires_grad}
             ema_obj.copy_to(model)
-
             val_loss, val_dice = validate(model, val_loader, loss_fn, cfg)
-
-            # restore
             with torch.no_grad():
                 for n, p in model.named_parameters():
                     if n in backup:
@@ -1016,31 +1422,37 @@ def main():
 
         rec = {
             "epoch": epoch,
-            "train_loss": tr_loss,
-            "val_loss": val_loss,
-            "val_dice": val_dice,
-            "lr": optimizer.param_groups[0]["lr"],
-            "time_sec": dt,
+            "train_loss": float(tr_loss),
+            "val_loss": float(val_loss),
+            "val_dice": [float(x) for x in val_dice],
+            "lr": float(optimizer.param_groups[0]["lr"]),
+            "time_sec": float(dt),
             "gpu": cfg.gpu,
             "patch_size": list(cfg.patch_size),
             "batch": cfg.batch_size,
             "accum_steps": cfg.accum_steps,
             "base_ch": cfg.base_ch,
             "mamba_layers": cfg.mamba_layers,
+            "snake_stages": sorted(list(cfg.snake_stages)),
+            "snake_k": cfg.snake_k,
+            "checkpoint_bottleneck": cfg.checkpoint_bottleneck,
             "cache_dir": str(cfg.cache_dir) if cfg.cache_dir is not None else None,
-            "include_background_losses": cfg.include_background_losses,
+            "amp": cfg.amp,
+            "amp_dtype": str(cfg.amp_dtype),
             "ema": cfg.ema,
             "ram_cache_items": cfg.ram_cache_items,
+            "min_fg_voxels": cfg.min_fg_voxels,
         }
-        history.append(rec)
-        print(json.dumps(rec))
 
-        # save
+        history.append(rec)
+        print(json.dumps(rec), flush=True)
+
+        # save last
         torch.save({"epoch": epoch, "model": model.state_dict()}, cfg.out_dir / "last.pt")
         (cfg.out_dir / "history.json").write_text(json.dumps(history, indent=2))
 
-        if val_loss < best_val:
-            best_val = val_loss
+        if val_loss < best_val and math.isfinite(val_loss):
+            best_val = float(val_loss)
             torch.save({"epoch": epoch, "model": model.state_dict(), "best_val": best_val}, cfg.out_dir / "best.pt")
 
     print(f"Done. Best val_loss={best_val:.6f} -> {cfg.out_dir/'best.pt'}")
