@@ -1,53 +1,45 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-train.py — Mamba-Snake 3D tubular segmentation (stable, sparse-aware, deep-supervised, bidir-mamba, xyz-snake)
-
-Main upgrades:
-- Bidirectional Mamba (forward + reverse) + optional multi-axis scanning at bottleneck
-- Snake refinement in x,y,z (not just z)
-- Deep supervision heads (/1, /2, /4, /8) with weighted losses
-- Sparse-aware patch sampling: --min-fg-voxels retries until patch has enough vessel voxels
-- Warmup + cosine LR
-- Scheduled CE foreground weight + scheduled clDice iterations + scheduled clDice weight
-- NaN guards (skip bad batches), optional grad clip
-- BF16 autocast recommended on A100
-
-Cache format expected:
-  img: [1,D,H,W] float16/float32 in [0,1]
-  lab: [D,H,W] uint8 (0..num_classes-1)
-"""
-
 from __future__ import annotations
 
-import os
-import math
-import json
-import time
-import random
 import argparse
-from dataclasses import dataclass
+import json
+import math
+import os
+import random
+import time
+from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Tuple, List, Dict, Optional, Any, Iterable, Set
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from collections import OrderedDict
 
 import numpy as np
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 
+# Optional deps for post-processing/HD95
+try:
+    import scipy.ndimage as ndi
+    _HAS_SCIPY = True
+except Exception:
+    _HAS_SCIPY = False
+
+try:
+    from monai.metrics import HausdorffDistanceMetric
+    _HAS_MONAI = True
+except Exception:
+    _HAS_MONAI = False
+
+
 # -------------------------
-# Repro / Perf flags
+# Utilities
 # -------------------------
 def seed_everything(seed: int = 42) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
 
 def enable_perf_flags(tf32: bool = True, cudnn_benchmark: bool = True) -> None:
     if tf32:
@@ -59,98 +51,43 @@ def enable_perf_flags(tf32: bool = True, cudnn_benchmark: bool = True) -> None:
             pass
     torch.backends.cudnn.benchmark = bool(cudnn_benchmark)
 
+def _autocast_dtype(name: str) -> torch.dtype:
+    name = name.lower()
+    if name == "bf16":
+        return torch.bfloat16
+    if name == "fp16":
+        return torch.float16
+    raise ValueError("amp dtype must be bf16 or fp16")
 
-# -------------------------
-# Patch ops
-# -------------------------
-def _pad_to_min_shape_torch(vol: torch.Tensor, target_dhw: Tuple[int, int, int], pad_value: float = 0.0) -> torch.Tensor:
-    # vol: [D,H,W] or [C,D,H,W]
-    if vol.ndim == 3:
-        D, H, W = vol.shape
-        has_c = False
-    elif vol.ndim == 4:
-        _, D, H, W = vol.shape
-        has_c = True
+def json_dump_safe(obj: Any, indent: int = 2) -> str:
+    def _conv(x):
+        if isinstance(x, Path):
+            return str(x)
+        if isinstance(x, set):
+            return sorted(list(x))
+        if isinstance(x, (np.integer, np.floating)):
+            return x.item()
+        if isinstance(x, (np.ndarray,)):
+            return x.tolist()
+        return x
+    return json.dumps(obj, indent=indent, default=_conv)
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+def _resolve_cached_path(uid: str, p: str, cache_dir: Path, kind: str) -> str:
+    pp = Path(p)
+    if pp.exists():
+        return str(pp)
+    if kind == "image":
+        alt = cache_dir / "images" / f"{uid}.pt"
     else:
-        raise RuntimeError(f"Unexpected vol ndim={vol.ndim}")
-
-    td, th, tw = target_dhw
-    pd0 = max(0, td - D)
-    ph0 = max(0, th - H)
-    pw0 = max(0, tw - W)
-    if pd0 == 0 and ph0 == 0 and pw0 == 0:
-        return vol
-
-    pd_before, pd_after = pd0 // 2, pd0 - (pd0 // 2)
-    ph_before, ph_after = ph0 // 2, ph0 - (ph0 // 2)
-    pw_before, pw_after = pw0 // 2, pw0 - (pw0 // 2)
-
-    pad = (pw_before, pw_after, ph_before, ph_after, pd_before, pd_after)
-    if has_c:
-        return F.pad(vol, pad, mode="constant", value=pad_value)
-    else:
-        return F.pad(vol.unsqueeze(0), pad, mode="constant", value=pad_value).squeeze(0)
-
-
-def _crop_around_center_torch(vol: torch.Tensor, center_dhw: Tuple[int, int, int], patch_dhw: Tuple[int, int, int]) -> torch.Tensor:
-    # vol: [D,H,W] or [C,D,H,W]
-    if vol.ndim == 3:
-        D, H, W = vol.shape
-        has_c = False
-    else:
-        _, D, H, W = vol.shape
-        has_c = True
-
-    pd, ph, pw = patch_dhw
-    cd, ch, cw = center_dhw
-
-    sd = int(np.clip(cd - pd // 2, 0, max(0, D - pd)))
-    sh = int(np.clip(ch - ph // 2, 0, max(0, H - ph)))
-    sw = int(np.clip(cw - pw // 2, 0, max(0, W - pw)))
-
-    if has_c:
-        return vol[:, sd:sd + pd, sh:sh + ph, sw:sw + pw]
-    else:
-        return vol[sd:sd + pd, sh:sh + ph, sw:sw + pw]
-
-
-def _random_center_from_label(label: torch.Tensor, want_fg: bool, rng: np.random.Generator) -> Tuple[int, int, int]:
-    if want_fg:
-        idx = (label > 0).nonzero(as_tuple=False)
-    else:
-        idx = (label == 0).nonzero(as_tuple=False)
-
-    if idx.numel() == 0:
-        D, H, W = label.shape
-        return (int(rng.integers(0, D)), int(rng.integers(0, H)), int(rng.integers(0, W)))
-
-    pick = idx[int(rng.integers(0, idx.shape[0]))]
-    return (int(pick[0].item()), int(pick[1].item()), int(pick[2].item()))
-
-
-def _augment_patch(img: torch.Tensor, lab: torch.Tensor, rng: np.random.Generator) -> Tuple[torch.Tensor, torch.Tensor]:
-    # flips
-    for axis in (1, 2, 3):  # img dims: C,D,H,W
-        if rng.random() < 0.5:
-            img = torch.flip(img, dims=(axis,))
-            lab = torch.flip(lab, dims=(axis - 1,))
-
-    # intensity jitter
-    if rng.random() < 0.25:
-        scale = float(rng.uniform(0.9, 1.1))
-        shift = float(rng.uniform(-0.05, 0.05))
-        img = torch.clamp(img * scale + shift, 0.0, 1.0)
-
-    # gaussian noise
-    if rng.random() < 0.20:
-        noise = torch.from_numpy(rng.normal(0.0, 0.01, size=img.shape).astype(np.float32))
-        img = torch.clamp(img + noise.to(img.device), 0.0, 1.0)
-
-    return img, lab
+        alt = cache_dir / "labels" / f"{uid}.pt"
+    return str(alt)
 
 
 # -------------------------
-# Case listing (cache)
+# Cache listing
 # -------------------------
 def list_cases_from_cache(cache_dir: Path) -> List[Dict[str, str]]:
     cases_json = cache_dir / "cases.json"
@@ -164,9 +101,8 @@ def list_cases_from_cache(cache_dir: Path) -> List[Dict[str, str]]:
     for uid in uids:
         items.append({"uid": uid, "image_pt": images[uid], "label_pt": labels[uid]})
     if not items:
-        raise RuntimeError(f"No cached items found in {cases_json}")
+        raise RuntimeError("No cached items found.")
     return items
-
 
 def split_train_val(items: List[Dict[str, str]], val_ratio: float = 0.1, seed: int = 42):
     rng = np.random.default_rng(seed)
@@ -177,7 +113,6 @@ def split_train_val(items: List[Dict[str, str]], val_ratio: float = 0.1, seed: i
     train = [items[i] for i in range(len(items)) if i not in val_idx]
     val = [items[i] for i in range(len(items)) if i in val_idx]
     return train, val
-
 
 class _LRUVolCache:
     def __init__(self, max_items: int = 0):
@@ -202,42 +137,122 @@ class _LRUVolCache:
             self.data.popitem(last=False)
 
 
-def _resolve_cached_path(uid: str, p: str, cache_dir: Path, kind: str) -> str:
-    pp = Path(p)
-    if pp.exists():
-        return str(pp)
-    # fallback canonical
-    if kind == "image":
-        alt = cache_dir / "images" / f"{uid}.pt"
+# -------------------------
+# Patch ops
+# -------------------------
+def _pad_to_min_shape_torch(vol: torch.Tensor, target_dhw: Tuple[int, int, int], pad_value: float = 0.0) -> torch.Tensor:
+    if vol.ndim == 3:
+        D, H, W = vol.shape
+        has_c = False
+    elif vol.ndim == 4:
+        _, D, H, W = vol.shape
+        has_c = True
     else:
-        alt = cache_dir / "labels" / f"{uid}.pt"
-    return str(alt)
+        raise RuntimeError(f"Unexpected vol ndim={vol.ndim}")
+
+    td, th, tw = target_dhw
+    pd0 = max(0, td - D)
+    ph0 = max(0, th - H)
+    pw0 = max(0, tw - W)
+    if pd0 == 0 and ph0 == 0 and pw0 == 0:
+        return vol
+
+    pd_before, pd_after = pd0 // 2, pd0 - (pd0 // 2)
+    ph_before, ph_after = ph0 // 2, ph0 - (ph0 // 2)
+    pw_before, pw_after = pw0 // 2, pw0 - (pw0 // 2)
+    pad = (pw_before, pw_after, ph_before, ph_after, pd_before, pd_after)
+
+    if has_c:
+        return F.pad(vol, pad, mode="constant", value=pad_value)
+    else:
+        return F.pad(vol.unsqueeze(0), pad, mode="constant", value=pad_value).squeeze(0)
+
+def _crop_around_center_torch(vol: torch.Tensor, center_dhw: Tuple[int, int, int], patch_dhw: Tuple[int, int, int]) -> torch.Tensor:
+    if vol.ndim == 3:
+        D, H, W = vol.shape
+        has_c = False
+    else:
+        _, D, H, W = vol.shape
+        has_c = True
+
+    pd, ph, pw = patch_dhw
+    cd, ch, cw = center_dhw
+
+    sd = int(np.clip(cd - pd // 2, 0, max(0, D - pd)))
+    sh = int(np.clip(ch - ph // 2, 0, max(0, H - ph)))
+    sw = int(np.clip(cw - pw // 2, 0, max(0, W - pw)))
+
+    if has_c:
+        return vol[:, sd:sd + pd, sh:sh + ph, sw:sw + pw]
+    else:
+        return vol[sd:sd + pd, sh:sh + ph, sw:sw + pw]
+
+def _augment_light_cpu(img: torch.Tensor, lab: torch.Tensor, rng: np.random.Generator) -> Tuple[torch.Tensor, torch.Tensor]:
+    # flips + intensity jitter + noise (cheap CPU ops)
+    for axis in (1, 2, 3):  # img dims: C,D,H,W
+        if rng.random() < 0.5:
+            img = torch.flip(img, dims=(axis,))
+            lab = torch.flip(lab, dims=(axis - 1,))
+
+    if rng.random() < 0.25:
+        scale = float(rng.uniform(0.9, 1.1))
+        shift = float(rng.uniform(-0.05, 0.05))
+        img = torch.clamp(img * scale + shift, 0.0, 1.0)
+
+    if rng.random() < 0.20:
+        noise = torch.from_numpy(rng.normal(0.0, 0.01, size=img.shape).astype(np.float32))
+        img = torch.clamp(img + noise, 0.0, 1.0)
+
+    return img, lab
 
 
+# -------------------------
+# Sampling DB loader
+# -------------------------
+def load_sampling_npz(path: Path) -> Tuple[np.ndarray, np.ndarray, Tuple[int,int,int]]:
+    z = np.load(path, allow_pickle=False)
+    fg = z["fg"].astype(np.int32)
+    hard = z["hardneg"].astype(np.int32)
+    shape = tuple(z["shape"].astype(np.int32).tolist())
+    return fg, hard, shape
+
+
+# -------------------------
+# Dataset
+# -------------------------
 class CachedPatchDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         items: List[Dict[str, str]],
         cache_dir: Path,
+        sampling_db_dir: Optional[Path],
         patch_size: Tuple[int, int, int],
         training: bool,
-        pos_ratio: float = 0.97,
-        seed: int = 42,
-        ram_cache_items: int = 0,
-        min_fg_voxels: int = 256,
-        max_center_tries: int = 32,
+        pos_ratio: float,
+        bg_hard_prob: float,
+        seed: int,
+        ram_cache_items: int,
+        center_jitter_prob: float,
+        center_jitter_frac: float,
     ):
         self.items = items
         self.cache_dir = Path(cache_dir)
+        self.sampling_db_dir = Path(sampling_db_dir) if sampling_db_dir is not None else None
         self.patch_size = tuple(int(x) for x in patch_size)
         self.training = bool(training)
-        self.pos_ratio = float(pos_ratio)
-        self.seed = int(seed)
-        self.min_fg_voxels = int(min_fg_voxels) if training else 0
-        self.max_center_tries = int(max_center_tries)
 
-        self.cache_img = _LRUVolCache(ram_cache_items)
-        self.cache_lab = _LRUVolCache(ram_cache_items)
+        self.pos_ratio = float(pos_ratio)
+        self.bg_hard_prob = float(bg_hard_prob)
+
+        self.seed = int(seed)
+        self.ram_cache_items = int(ram_cache_items)
+
+        self.center_jitter_prob = float(center_jitter_prob) if training else 0.0
+        self.center_jitter_frac = float(center_jitter_frac) if training else 0.0
+
+        self.cache_img = _LRUVolCache(self.ram_cache_items)
+        self.cache_lab = _LRUVolCache(self.ram_cache_items)
+        self.cache_samp = _LRUVolCache(max_items=max(0, self.ram_cache_items))
 
     def __len__(self) -> int:
         return len(self.items)
@@ -250,256 +265,299 @@ class CachedPatchDataset(torch.utils.data.Dataset):
             lab_path2 = _resolve_cached_path(uid, lab_path, self.cache_dir, "label")
             img = torch.load(img_path2, map_location="cpu")  # [1,D,H,W]
             lab = torch.load(lab_path2, map_location="cpu")  # [D,H,W]
-            if img.dtype not in (torch.float16, torch.float32):
-                img = img.float()
-            if lab.dtype != torch.uint8:
-                lab = lab.to(torch.uint8)
+            img = img.float()
+            lab = (lab > 0).to(torch.uint8)
             self.cache_img.put(uid, img)
             self.cache_lab.put(uid, lab)
         return img, lab
 
-    def _choose_center(self, lab: torch.Tensor, rng: np.random.Generator) -> Tuple[int, int, int]:
+    def _load_sampling(self, uid: str) -> Tuple[np.ndarray, np.ndarray]:
+        if self.sampling_db_dir is None:
+            return np.zeros((0,3), np.int32), np.zeros((0,3), np.int32)
+        cached = self.cache_samp.get(uid)
+        if cached is not None:
+            return cached
+        p = self.sampling_db_dir / f"{uid}.npz"
+        if not p.exists():
+            return np.zeros((0,3), np.int32), np.zeros((0,3), np.int32)
+        fg, hard, _ = load_sampling_npz(p)
+        self.cache_samp.put(uid, (fg, hard))
+        return fg, hard
+
+    def _choose_center(self, uid: str, lab: torch.Tensor, rng: np.random.Generator) -> Tuple[int,int,int]:
+        D, H, W = lab.shape
         if not self.training:
-            D, H, W = lab.shape
-            return (D // 2, H // 2, W // 2)
+            return (D//2, H//2, W//2)
 
         want_fg = (rng.random() < self.pos_ratio)
-        if self.min_fg_voxels <= 0:
-            return _random_center_from_label(lab, want_fg=want_fg, rng=rng)
+        fg_coords, hard_coords = self._load_sampling(uid)
 
-        best_c = None
-        best_fg = -1
-        for _ in range(self.max_center_tries):
-            c = _random_center_from_label(lab, want_fg=want_fg, rng=rng)
-            lab_p = _crop_around_center_torch(lab, c, self.patch_size)
-            fg = int((lab_p > 0).sum().item())
-            if fg >= self.min_fg_voxels:
-                return c
-            if fg > best_fg:
-                best_fg = fg
-                best_c = c
-        return best_c if best_c is not None else _random_center_from_label(lab, want_fg=True, rng=rng)
+        if want_fg and fg_coords.shape[0] > 0:
+            z,y,x = fg_coords[int(rng.integers(0, fg_coords.shape[0]))]
+            return (int(z), int(y), int(x))
+
+        # background: prefer anatomical hard negatives
+        use_hard = (hard_coords.shape[0] > 0) and (rng.random() < self.bg_hard_prob)
+        if use_hard:
+            z,y,x = hard_coords[int(rng.integers(0, hard_coords.shape[0]))]
+            return (int(z), int(y), int(x))
+
+        # fallback passive
+        return (int(rng.integers(0, D)), int(rng.integers(0, H)), int(rng.integers(0, W)))
+
+    def _jitter_center(self, center: Tuple[int,int,int], vol_shape: Tuple[int,int,int], rng: np.random.Generator) -> Tuple[int,int,int]:
+        if rng.random() > self.center_jitter_prob:
+            return center
+        D,H,W = vol_shape
+        pd,ph,pw = self.patch_size
+        jd = int(round(pd * self.center_jitter_frac))
+        jh = int(round(ph * self.center_jitter_frac))
+        jw = int(round(pw * self.center_jitter_frac))
+        od = int(rng.integers(-jd, jd+1)) if jd>0 else 0
+        oh = int(rng.integers(-jh, jh+1)) if jh>0 else 0
+        ow = int(rng.integers(-jw, jw+1)) if jw>0 else 0
+        cd,ch,cw = center
+        cd = int(np.clip(cd+od, 0, max(0,D-1)))
+        ch = int(np.clip(ch+oh, 0, max(0,H-1)))
+        cw = int(np.clip(cw+ow, 0, max(0,W-1)))
+        return (cd,ch,cw)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         it = self.items[idx]
         uid = it["uid"]
+
         base = self.seed + idx * 10007
         if self.training:
-            base += int(time.time() * 1000) % 100000
+            base += (_now_ms() % 100000)
         rng = np.random.default_rng(base)
 
-        img, lab = self._load_pair(uid, it["image_pt"], it["label_pt"])  # img [1,D,H,W], lab [D,H,W]
+        img, lab = self._load_pair(uid, it["image_pt"], it["label_pt"])
         img = _pad_to_min_shape_torch(img, self.patch_size, pad_value=0.0)
         lab = _pad_to_min_shape_torch(lab, self.patch_size, pad_value=0)
 
-        center = self._choose_center(lab, rng)
-        img_p = _crop_around_center_torch(img, center, self.patch_size)
-        lab_p = _crop_around_center_torch(lab, center, self.patch_size)
+        center = self._choose_center(uid, lab, rng)
+        center = self._jitter_center(center, tuple(lab.shape), rng)
+
+        img_p = _crop_around_center_torch(img, center, self.patch_size)          # [1,pd,ph,pw]
+        lab_p = _crop_around_center_torch(lab, center, self.patch_size).long()  # [pd,ph,pw]
 
         if self.training:
-            img_p, lab_p = _augment_patch(img_p, lab_p.long(), rng=rng)
-        else:
-            lab_p = lab_p.long()
+            img_p, lab_p = _augment_light_cpu(img_p, lab_p, rng=rng)
 
         return {"image": img_p.contiguous(), "label": lab_p.contiguous(), "uid": uid}
 
 
 # -------------------------
-# Losses (Dice/Tversky/clDice + scheduled CE weight + optional boundary)
+# Deep supervision label downsample (MaxPool)
+# -------------------------
+def downsample_label_maxpool(lab: torch.Tensor, factor: int) -> torch.Tensor:
+    if factor == 1:
+        return lab
+    x = (lab > 0).float().unsqueeze(1)  # [B,1,D,H,W]
+    y = F.max_pool3d(x, kernel_size=factor, stride=factor, padding=0)
+    return (y.squeeze(1) > 0.5).long()
+
+
+# -------------------------
+# Losses
 # -------------------------
 class SoftDiceLoss(nn.Module):
-    def __init__(self, smooth: float = 1e-5, include_background: bool = False):
+    def __init__(self, smooth: float = 1e-5):
         super().__init__()
         self.smooth = float(smooth)
-        self.include_background = bool(include_background)
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        if logits.shape[2:] != targets.shape[-3:]:
-            logits = F.interpolate(logits, size=targets.shape[-3:], mode="trilinear", align_corners=False)
-        C = logits.shape[1]
         probs = torch.softmax(logits.float(), dim=1)
-        onehot = F.one_hot(targets.long(), num_classes=C).permute(0, 4, 1, 2, 3).float()
-        if (not self.include_background) and C > 1:
-            probs = probs[:, 1:]
-            onehot = onehot[:, 1:]
-        dims = tuple(range(2, probs.ndim))
-        inter = torch.sum(probs * onehot, dim=dims)
-        den = torch.sum(probs + onehot, dim=dims)
-        dice = (2.0 * inter + self.smooth) / (den + self.smooth)
+        fg = probs[:, 1:2]
+        tgt = (targets > 0).float().unsqueeze(1)
+        dims = (2,3,4)
+        inter = (fg * tgt).sum(dims)
+        den = (fg + tgt).sum(dims)
+        dice = (2*inter + self.smooth) / (den + self.smooth)
         return 1.0 - dice.mean()
 
-
 class TverskyLoss(nn.Module):
-    def __init__(self, alpha=0.3, beta=0.7, smooth=1e-5, include_background: bool = False):
+    def __init__(self, alpha=0.3, beta=0.7, smooth=1e-5):
         super().__init__()
-        self.alpha = float(alpha)
-        self.beta = float(beta)
-        self.smooth = float(smooth)
-        self.include_background = bool(include_background)
+        self.alpha=float(alpha); self.beta=float(beta); self.smooth=float(smooth)
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        if logits.shape[2:] != targets.shape[-3:]:
-            logits = F.interpolate(logits, size=targets.shape[-3:], mode="trilinear", align_corners=False)
-        C = logits.shape[1]
         probs = torch.softmax(logits.float(), dim=1)
-        onehot = F.one_hot(targets.long(), num_classes=C).permute(0, 4, 1, 2, 3).float()
-        if (not self.include_background) and C > 1:
-            probs = probs[:, 1:]
-            onehot = onehot[:, 1:]
-        dims = tuple(range(2, probs.ndim))
-        tp = torch.sum(probs * onehot, dim=dims)
-        fp = torch.sum(probs * (1 - onehot), dim=dims)
-        fn = torch.sum((1 - probs) * onehot, dim=dims)
-        t = (tp + self.smooth) / (tp + self.alpha * fp + self.beta * fn + self.smooth)
-        return 1.0 - t.mean()
-
+        p = probs[:,1:2]
+        t = (targets>0).float().unsqueeze(1)
+        dims=(2,3,4)
+        tp = (p*t).sum(dims)
+        fp = (p*(1-t)).sum(dims)
+        fn = ((1-p)*t).sum(dims)
+        tv = (tp + self.smooth)/(tp + self.alpha*fp + self.beta*fn + self.smooth)
+        return 1.0 - tv.mean()
 
 def _soft_erode(img: torch.Tensor) -> torch.Tensor:
-    p1 = -F.max_pool3d(-img, kernel_size=(3, 1, 1), stride=1, padding=(1, 0, 0))
-    p2 = -F.max_pool3d(-img, kernel_size=(1, 3, 1), stride=1, padding=(0, 1, 0))
-    p3 = -F.max_pool3d(-img, kernel_size=(1, 1, 3), stride=1, padding=(0, 0, 1))
-    return torch.min(torch.min(p1, p2), p3)
-
+    p1 = -F.max_pool3d(-img, kernel_size=(3,1,1), stride=1, padding=(1,0,0))
+    p2 = -F.max_pool3d(-img, kernel_size=(1,3,1), stride=1, padding=(0,1,0))
+    p3 = -F.max_pool3d(-img, kernel_size=(1,1,3), stride=1, padding=(0,0,1))
+    return torch.min(torch.min(p1,p2),p3)
 
 def _soft_dilate(img: torch.Tensor) -> torch.Tensor:
     return F.max_pool3d(img, kernel_size=3, stride=1, padding=1)
 
-
 def _soft_open(img: torch.Tensor) -> torch.Tensor:
     return _soft_dilate(_soft_erode(img))
 
-
 def _soft_skel(img: torch.Tensor, iters: int) -> torch.Tensor:
-    img = torch.clamp(img, 0.0, 1.0)
+    img = torch.clamp(img, 0, 1)
     img1 = _soft_open(img)
     skel = F.relu(img - img1)
     for _ in range(iters):
         img = _soft_erode(img)
         img1 = _soft_open(img)
         delta = F.relu(img - img1)
-        skel = skel + F.relu(delta - skel * delta)
+        skel = skel + F.relu(delta - skel*delta)
     return torch.nan_to_num(skel, nan=0.0, posinf=0.0, neginf=0.0)
 
-
 class SoftclDiceLoss(nn.Module):
-    def __init__(self, iters: int = 6, smooth: float = 1e-5):
+    def __init__(self, iters: int = 10, smooth: float = 1e-5):
         super().__init__()
-        self.iters = int(iters)
-        self.smooth = float(smooth)
+        self.iters=int(iters); self.smooth=float(smooth)
 
-    def set_iters(self, iters: int) -> None:
-        self.iters = int(iters)
+    def set_iters(self, iters: int):
+        self.iters=int(iters)
 
     def forward(self, probs_fg: torch.Tensor, targets_fg: torch.Tensor) -> torch.Tensor:
-        # fp32
-        probs_fg = probs_fg.float()
-        targets_fg = targets_fg.float()
-        skel_p = _soft_skel(probs_fg, self.iters)
-        skel_t = _soft_skel(targets_fg, self.iters)
-        tprec = (torch.sum(skel_p * targets_fg) + self.smooth) / (torch.sum(skel_p) + self.smooth)
-        tsens = (torch.sum(skel_t * probs_fg) + self.smooth) / (torch.sum(skel_t * probs_fg) + self.smooth)
-        cl = (2 * tprec * tsens) / (tprec + tsens + self.smooth)
+        p = probs_fg.float()
+        t = targets_fg.float()
+        sp = _soft_skel(p, self.iters)
+        st = _soft_skel(t, self.iters)
+        tprec = (sp*t).sum() + self.smooth
+        tprec = tprec / ((sp).sum() + self.smooth)
+        tsens = (st*p).sum() + self.smooth
+        tsens = tsens / ((st).sum() + self.smooth)
+        cl = (2*tprec*tsens)/(tprec+tsens+self.smooth)
         cl = torch.nan_to_num(cl, nan=0.0, posinf=0.0, neginf=0.0)
         return 1.0 - cl
 
-
 class BoundaryLoss(nn.Module):
-    """
-    Lightweight boundary penalty using morphological gradient.
-    Helps reduce vessel thickening without expensive distance transforms.
-    """
-    def __init__(self):
-        super().__init__()
-
     def forward(self, probs_fg: torch.Tensor, targets_fg: torch.Tensor) -> torch.Tensor:
-        # probs_fg/targets_fg: [B,1,D,H,W] in fp32
         p = probs_fg.float()
         t = targets_fg.float()
-        t_d = _soft_dilate(t)
-        t_e = _soft_erode(t)
-        t_edge = torch.clamp(t_d - t_e, 0.0, 1.0)
-
-        p_d = _soft_dilate(p)
-        p_e = _soft_erode(p)
-        p_edge = torch.clamp(p_d - p_e, 0.0, 1.0)
-
+        t_edge = torch.clamp(_soft_dilate(t) - _soft_erode(t), 0.0, 1.0)
+        p_edge = torch.clamp(_soft_dilate(p) - _soft_erode(p), 0.0, 1.0)
         return F.l1_loss(p_edge, t_edge)
 
-
-class TubularLoss(nn.Module):
-    def __init__(
-        self,
-        num_classes: int,
-        w_tversky: float,
-        w_dice: float,
-        w_cldice: float,
-        w_ce: float,
-        w_bnd: float,
-        alpha: float,
-        beta: float,
-        include_background: bool,
-        cldice_iters: int,
-        ce_weight_fg: float,
-    ):
+class FocalCE(nn.Module):
+    def __init__(self, alpha: float=0.75, gamma: float=2.0):
         super().__init__()
-        self.num_classes = int(num_classes)
-        self.w_tversky = float(w_tversky)
-        self.w_dice = float(w_dice)
-        self.w_cldice = float(w_cldice)
-        self.w_ce = float(w_ce)
-        self.w_bnd = float(w_bnd)
-
-        self.tv = TverskyLoss(alpha=alpha, beta=beta, include_background=include_background)
-        self.dice = SoftDiceLoss(include_background=include_background)
-        self.cldice = SoftclDiceLoss(iters=cldice_iters)
-        self.bnd = BoundaryLoss()
-
-        # CE weights (binary expected here)
-        if self.num_classes == 2:
-            w = torch.tensor([1.0, float(ce_weight_fg)], dtype=torch.float32)
-            self.ce = nn.CrossEntropyLoss(weight=w)
-        else:
-            self.ce = nn.CrossEntropyLoss()
-
-    def set_ce_weight_fg(self, w_fg: float) -> None:
-        if self.num_classes == 2:
-            w = torch.tensor([1.0, float(w_fg)], dtype=torch.float32, device=self.ce.weight.device if self.ce.weight is not None else None)
-            self.ce = nn.CrossEntropyLoss(weight=w)
-
-    def set_cldice_iters(self, iters: int) -> None:
-        self.cldice.set_iters(iters)
-
-    def set_w_cldice(self, w: float) -> None:
-        self.w_cldice = float(w)
+        self.alpha=float(alpha); self.gamma=float(gamma)
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        if logits.shape[2:] != targets.shape[-3:]:
-            logits = F.interpolate(logits, size=targets.shape[-3:], mode="trilinear", align_corners=False)
+        logp = F.log_softmax(logits.float(), dim=1)
+        p = torch.exp(logp)
+        tgt = targets.long().unsqueeze(1)
+        logpt = torch.gather(logp, dim=1, index=tgt).squeeze(1)
+        pt = torch.gather(p, dim=1, index=tgt).squeeze(1)
+        alpha_t = torch.where(targets>0,
+                              torch.tensor(self.alpha, device=logits.device),
+                              torch.tensor(1.0-self.alpha, device=logits.device))
+        loss = -alpha_t * (1.0-pt).clamp_min(0)**self.gamma * logpt
+        return loss.mean()
 
-        loss = logits.new_tensor(0.0)
+class TubularLoss(nn.Module):
+    def __init__(self, ce_weight_fg: float):
+        super().__init__()
+        self.tv = TverskyLoss(0.3,0.7)
+        self.dice = SoftDiceLoss()
+        self.cldice = SoftclDiceLoss(10)
+        self.bnd = BoundaryLoss()
+        self.focal = FocalCE(alpha=0.75, gamma=2.0)
+        self.register_buffer("ce_w", torch.tensor([1.0, float(ce_weight_fg)], dtype=torch.float32))
 
-        if self.w_tversky > 0:
-            loss = loss + self.w_tversky * self.tv(logits, targets)
-        if self.w_dice > 0:
-            loss = loss + self.w_dice * self.dice(logits, targets)
+        self.w_tv=0.55; self.w_dice=0.20; self.w_ce=0.15; self.w_bnd=0.10
+        self.w_focal=0.0; self.w_cldice=0.0
+
+    def set_weights(self, w_focal: float, w_cldice: float, w_bnd: float, ce_wfg: float, cl_iters: int):
+        self.w_focal=float(w_focal)
+        self.w_cldice=float(w_cldice)
+        self.w_bnd=float(w_bnd)
+        self.ce_w[0]=1.0; self.ce_w[1]=float(ce_wfg)
+        self.cldice.set_iters(int(cl_iters))
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        loss = 0.0
+        loss = loss + self.w_tv * self.tv(logits, targets)
+        loss = loss + self.w_dice * self.dice(logits, targets)
         if self.w_ce > 0:
-            loss = loss + self.w_ce * self.ce(logits.float(), targets.long())
+            loss = loss + self.w_ce * F.cross_entropy(logits.float(), targets.long(), weight=self.ce_w)
+        if self.w_focal > 0:
+            loss = loss + self.w_focal * self.focal(logits, targets)
 
-        # clDice + boundary in fp32
-        if (self.w_cldice > 0) or (self.w_bnd > 0):
+        if self.w_cldice > 0 or self.w_bnd > 0:
             probs = torch.softmax(logits.float(), dim=1)
-            probs_fg = 1.0 - probs[:, 0:1]
-            tgt_fg = (targets > 0).float().unsqueeze(1)
+            pfg = probs[:,1:2]
+            tfg = (targets>0).float().unsqueeze(1)
             if self.w_cldice > 0:
-                loss = loss + self.w_cldice * self.cldice(probs_fg, tgt_fg)
+                loss = loss + self.w_cldice * self.cldice(pfg, tfg)
             if self.w_bnd > 0:
-                loss = loss + self.w_bnd * self.bnd(probs_fg, tgt_fg)
+                loss = loss + self.w_bnd * self.bnd(pfg, tfg)
 
         return torch.nan_to_num(loss, nan=1.0, posinf=1.0, neginf=1.0)
 
 
 # -------------------------
-# Model blocks: GN convs + BiMamba (multi-axis) + XYZ-Snake
+# Multi-stage loss schedule (clDice delayed)
+# teach coarse vessels first; ramp clDice after cldice_ramp_e0
+# -------------------------
+def loss_schedule(epoch: int, total_epochs: int, cldice_ramp_e0: int) -> Tuple[float,float,float,int,float]:
+    """
+    Returns: (w_focal, w_cldice, w_bnd, cl_iters, ce_wfg_target)
+    """
+    # Stage A: warm start 1..50: Focal+Dice, clDice OFF until cldice_ramp_e0
+    if epoch <= 50:
+        w_focal = 0.25
+        w_bnd = 0.05
+        ce_w = 50.0
+        # clDice delayed
+        if epoch < cldice_ramp_e0:
+            w_cl = 0.0
+            iters = 0
+        else:
+            # gentle start
+            w_cl = 0.05
+            iters = 10
+        return w_focal, w_cl, w_bnd, iters, ce_w
+
+    # Stage B: 50..min(200,total): fade focal, ramp clDice+Boundary
+    t = (epoch - 50) / max(1, min(200, total_epochs) - 50)
+    t = float(np.clip(t, 0.0, 1.0))
+
+    w_focal = 0.25 * (1.0 - t)
+    w_bnd = 0.05 + t * (0.20 - 0.05)
+
+    # clDice still delayed until cldice_ramp_e0, then ramp to 0.50
+    if epoch < cldice_ramp_e0:
+        w_cl = 0.0
+        iters = 0
+    else:
+        # ramp progress from cldice_ramp_e0..200
+        t2 = (epoch - cldice_ramp_e0) / max(1, min(200, total_epochs) - cldice_ramp_e0)
+        t2 = float(np.clip(t2, 0.0, 1.0))
+        w_cl = 0.05 + t2 * (0.50 - 0.05)
+        iters = int(round(10 + t2*(25-10)))
+
+    ce_w = 50.0 - t*(50.0-5.0)  # ease down
+    return w_focal, w_cl, w_bnd, iters, ce_w
+
+def deep_sup_weights(epoch: int, start: int, end: int, w2: float, w3: float, w4: float) -> Tuple[float,float,float]:
+    if epoch <= start:
+        return w2,w3,w4
+    if epoch >= end:
+        return 0.0,0.0,0.0
+    t = (epoch-start)/max(1,(end-start))
+    s = 1.0 - t
+    return w2*s, w3*s, w4*s
+
+
+# -------------------------
+# Model blocks
 # -------------------------
 def _gn(ch: int, groups: int = 16) -> nn.GroupNorm:
     g = min(groups, ch)
@@ -507,307 +565,573 @@ def _gn(ch: int, groups: int = 16) -> nn.GroupNorm:
         g -= 1
     return nn.GroupNorm(g, ch)
 
-
 class ConvBlock(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, gn_groups: int = 16):
         super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv3d(in_ch, out_ch, 3, padding=1, bias=False),
-            _gn(out_ch, gn_groups),
-            nn.SiLU(),
-            nn.Conv3d(out_ch, out_ch, 3, padding=1, bias=False),
-            _gn(out_ch, gn_groups),
-            nn.SiLU(),
-        )
+        self.conv1 = nn.Conv3d(in_ch, out_ch, 3, padding=1, bias=False)
+        self.gn1 = _gn(out_ch, gn_groups)
+        self.conv2 = nn.Conv3d(out_ch, out_ch, 3, padding=1, bias=False)
+        self.gn2 = _gn(out_ch, gn_groups)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(x)
-
+    def forward(self, x):
+        x = F.silu(self.gn1(self.conv1(x)))
+        x = F.silu(self.gn2(self.conv2(x)))
+        return x
 
 class Down(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, gn_groups: int = 16):
         super().__init__()
         self.down = nn.Sequential(
-            nn.Conv3d(in_ch, out_ch, kernel_size=2, stride=2, bias=False),
+            nn.Conv3d(in_ch, out_ch, 2, stride=2, bias=False),
             _gn(out_ch, gn_groups),
             nn.SiLU(),
         )
         self.block = ConvBlock(out_ch, out_ch, gn_groups)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         return self.block(self.down(x))
 
-
-def _make_base_grid_3d(B: int, D: int, H: int, W: int, device: torch.device) -> torch.Tensor:
-    zz = torch.linspace(-1, 1, D, device=device)
-    yy = torch.linspace(-1, 1, H, device=device)
-    xx = torch.linspace(-1, 1, W, device=device)
+def _make_base_grid_3d(B: int, D: int, H: int, W: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """
+    Returns grid as (B,3,D,H,W) with channels=(x,y,z) in [-1,1].
+    """
+    zz = torch.linspace(-1, 1, D, device=device, dtype=dtype)
+    yy = torch.linspace(-1, 1, H, device=device, dtype=dtype)
+    xx = torch.linspace(-1, 1, W, device=device, dtype=dtype)
     z, y, x = torch.meshgrid(zz, yy, xx, indexing="ij")
-    grid = torch.stack([x, y, z], dim=-1)  # (D,H,W,3)
-    return grid.unsqueeze(0).repeat(B, 1, 1, 1, 1)
+    grid = torch.stack([x, y, z], dim=0)  # (3,D,H,W)
+    return grid.unsqueeze(0).repeat(B, 1, 1, 1, 1)  # (B,3,D,H,W)
 
+def _make_grid_for_sample(B: int, D: int, H: int, W: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """
+    Returns grid as (B,D,H,W,3) for grid_sample.
+    """
+    g = _make_base_grid_3d(B, D, H, W, device, dtype)  # (B,3,D,H,W)
+    return g.permute(0,2,3,4,1).contiguous()          # (B,D,H,W,3)
+
+class CoordInject3D(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Conv3d(3, channels, 1, bias=False),
+            _gn(channels, 16),
+            nn.SiLU(),
+        )
+
+    def forward(self, x):
+        B,C,D,H,W = x.shape
+        g = _make_base_grid_3d(B,D,H,W,x.device,x.dtype)
+        return x + self.proj(g)
 
 class SnakeRefine3DXYZ(nn.Module):
-    """
-    XYZ snake refinement using grid_sample.
-    NOTE: This is expensive at full resolution; enable it only for lower-res decoder stages.
-    """
     def __init__(self, channels: int, K: int = 3, offset_scale: float = 0.25):
         super().__init__()
         assert K >= 3 and K % 2 == 1
         self.K = int(K)
         self.half = self.K // 2
         self.offset_scale = float(offset_scale)
-
-        # 3*(K-1) offsets: (dx,dy,dz) for each step
-        self.offset_pred = nn.Conv3d(channels, 3 * (self.K - 1), kernel_size=3, padding=1)
+        self.offset_pred = nn.Conv3d(channels, 3*(self.K-1), 3, padding=1)
         self.fuse = nn.Sequential(
-            nn.Conv3d(channels * self.K, channels, kernel_size=1, bias=False),
+            nn.Conv3d(channels*self.K, channels, 1, bias=False),
             _gn(channels, 16),
             nn.SiLU(),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, D, H, W = x.shape
+    def forward(self, x):
+        B,C,D,H,W = x.shape
         delta = torch.tanh(self.offset_pred(x)) * self.offset_scale
-        delta = delta.view(B, 3, self.K - 1, D, H, W)  # [B,3,K-1,D,H,W]
-        base = _make_base_grid_3d(B, D, H, W, x.device)
+        delta = delta.view(B, 3, self.K-1, D,H,W)
+
+        base = _make_grid_for_sample(B,D,H,W,x.device,delta.dtype)  # (B,D,H,W,3)
         grids = [base]
 
-        # positive direction cumulative offsets
-        cum = torch.zeros((B, 3, 1, D, H, W), device=x.device, dtype=delta.dtype)
-        for s in range(1, self.half + 1):
-            cum = cum + delta[:, :, s - 1:s, ...]
+        # positive direction
+        cum = torch.zeros((B,3,D,H,W), device=x.device, dtype=delta.dtype)
+        for s in range(self.half):
+            cum = cum + delta[:,:,s]
             g = base.clone()
-            # x,y,z in grid are 0,1,2
-            g[..., 0] = g[..., 0] + (cum[:, 0, 0] * (2.0 / max(1, W - 1)))
-            g[..., 1] = g[..., 1] + (cum[:, 1, 0] * (2.0 / max(1, H - 1)))
-            g[..., 2] = g[..., 2] + (cum[:, 2, 0] * (2.0 / max(1, D - 1)))
+            g[...,0] = g[...,0] + (cum[:,0] * (2.0/max(1,W-1)))
+            g[...,1] = g[...,1] + (cum[:,1] * (2.0/max(1,H-1)))
+            g[...,2] = g[...,2] + (cum[:,2] * (2.0/max(1,D-1)))
             grids.append(g)
 
-        # negative direction cumulative offsets
-        cum = torch.zeros((B, 3, 1, D, H, W), device=x.device, dtype=delta.dtype)
-        for s in range(1, self.half + 1):
-            cum = cum + delta[:, :, s - 1:s, ...]
+        # negative direction
+        cum = torch.zeros((B,3,D,H,W), device=x.device, dtype=delta.dtype)
+        for s in range(self.half):
+            cum = cum + delta[:,:,s]
             g = base.clone()
-            g[..., 0] = g[..., 0] - (cum[:, 0, 0] * (2.0 / max(1, W - 1)))
-            g[..., 1] = g[..., 1] - (cum[:, 1, 0] * (2.0 / max(1, H - 1)))
-            g[..., 2] = g[..., 2] - (cum[:, 2, 0] * (2.0 / max(1, D - 1)))
+            g[...,0] = g[...,0] - (cum[:,0] * (2.0/max(1,W-1)))
+            g[...,1] = g[...,1] - (cum[:,1] * (2.0/max(1,H-1)))
+            g[...,2] = g[...,2] - (cum[:,2] * (2.0/max(1,D-1)))
             grids.append(g)
 
         sampled = [F.grid_sample(x, g, mode="bilinear", padding_mode="border", align_corners=True) for g in grids]
-        y = torch.cat(sampled, dim=1)
-        y = self.fuse(y)
+        y = self.fuse(torch.cat(sampled, dim=1))
         return x + y
 
-
 class Up(nn.Module):
-    def __init__(self, in_ch: int, skip_ch: int, out_ch: int, use_snake: bool, snake_k: int, gn_groups: int = 16):
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int, use_snake: bool, snake_k: int,
+                 gn_groups: int = 16, checkpoint_block: bool = False):
         super().__init__()
-        self.up = nn.ConvTranspose3d(in_ch, out_ch, kernel_size=2, stride=2, bias=False)
+        self.up = nn.ConvTranspose3d(in_ch, out_ch, 2, stride=2, bias=False)
         self.block = ConvBlock(out_ch + skip_ch, out_ch, gn_groups)
         self.snake = SnakeRefine3DXYZ(out_ch, K=snake_k) if use_snake else nn.Identity()
+        self.checkpoint_block = bool(checkpoint_block)
 
-    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+    def forward(self, x, skip):
         x = self.up(x)
-        # pad/crop to match skip
         dz = skip.shape[2] - x.shape[2]
         dy = skip.shape[3] - x.shape[3]
         dx = skip.shape[4] - x.shape[4]
         if dz or dy or dx:
-            x = F.pad(x, [dx // 2, dx - dx // 2, dy // 2, dy - dy // 2, dz // 2, dz - dz // 2])
+            x = F.pad(x, [dx//2, dx-dx//2, dy//2, dy-dy//2, dz//2, dz-dz//2])
         x = torch.cat([skip, x], dim=1)
-        x = self.block(x)
+        if self.training and self.checkpoint_block:
+            x = checkpoint(self.block, x, use_reentrant=False)
+        else:
+            x = self.block(x)
         return self.snake(x)
 
-
 def _parse_stages(s: str) -> Set[str]:
-    out: Set[str] = set()
+    out=set()
     for t in s.split(","):
-        t = t.strip()
-        if t:
-            out.add(t)
+        t=t.strip()
+        if t: out.add(t)
     return out
 
-
 def _parse_mamba_axes(s: str) -> List[str]:
-    # e.g. "dhw,hwd,wdh"
-    axes = []
+    axes=[]
     for t in s.split(","):
-        t = t.strip().lower()
-        if t:
-            if set(t) != set("dhw") or len(t) != 3:
-                raise ValueError(f"Bad mamba axis order: {t} (use permutations of 'd','h','w')")
-            axes.append(t)
+        t=t.strip().lower()
+        if not t: continue
+        if set(t)!=set("dhw") or len(t)!=3:
+            raise ValueError(f"Bad mamba axis order: {t}")
+        axes.append(t)
     return axes
 
-
-def _permute_for_axis(x: torch.Tensor, order: str) -> Tuple[torch.Tensor, Tuple[int, int, int]]:
-    # x: [B,C,D,H,W]
-    # return x_perm, inv permutation to restore
-    axes = {'d': 2, 'h': 3, 'w': 4}
-    perm = [0, 1, axes[order[0]], axes[order[1]], axes[order[2]]]
-    inv = [0, 1, 0, 0, 0]
-    for i, p in enumerate(perm):
-        inv[p] = i
-    x_p = x.permute(*perm).contiguous()
-    # return inv spatial mapping for restore (we only need spatial inverse indices)
-    # inv gives positions of original dims in permuted tensor
-    return x_p, (inv[2], inv[3], inv[4])
-
+def _permute_for_axis(x: torch.Tensor, order: str) -> torch.Tensor:
+    axes={'d':2,'h':3,'w':4}
+    perm=[0,1,axes[order[0]],axes[order[1]],axes[order[2]]]
+    return x.permute(*perm).contiguous()
 
 class BiMambaSSM(nn.Module):
-    """
-    Bidirectional Mamba block.
-    Optional multi-axis scanning by permuting (D,H,W) orderings at bottleneck.
-    """
-    def __init__(self, dim: int, d_state: int = 16, d_conv: int = 4, expand: int = 2, dropout: float = 0.0, axes: List[str] = ["dhw"]):
+    def __init__(self, dim: int, axes: List[str], dropout: float = 0.0):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
         self.dropout = nn.Dropout(dropout)
         self.axes = axes
-
-        from mamba_ssm import Mamba  # must work
-
-        self.mamba_fwd = Mamba(d_model=dim, d_state=d_state, d_conv=d_conv, expand=expand)
-        self.mamba_bwd = Mamba(d_model=dim, d_state=d_state, d_conv=d_conv, expand=expand)
+        try:
+            from mamba_ssm import Mamba
+        except Exception as e:
+            raise RuntimeError("mamba_ssm not installed: pip install mamba-ssm") from e
+        self.mf = Mamba(d_model=dim, d_state=16, d_conv=4, expand=2)
+        self.mb = Mamba(d_model=dim, d_state=16, d_conv=4, expand=2)
 
     def _run_seq(self, seq: torch.Tensor) -> torch.Tensor:
-        # seq: [B,L,C]
         y = self.norm(seq)
-        y_f = self.mamba_fwd(y)
-        y_r = torch.flip(self.mamba_bwd(torch.flip(y, dims=(1,))), dims=(1,))
+        y_f = self.mf(y)
+        y_r = torch.flip(self.mb(torch.flip(y, dims=(1,))), dims=(1,))
         y = y_f + y_r
         y = self.dropout(y)
         return seq + y
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x [B,C,D,H,W]
-        B, C, D, H, W = x.shape
-        outs = []
-
+        B,C,D,H,W = x.shape
+        outs=[]
         for ax in self.axes:
-            x_p, inv_sp = _permute_for_axis(x, ax)  # [B,C,D',H',W']
-            _, _, Dp, Hp, Wp = x_p.shape
-            seq = x_p.permute(0, 2, 3, 4, 1).reshape(B, Dp * Hp * Wp, C)  # [B,L,C]
+            xp = _permute_for_axis(x, ax)
+            _,_,Dp,Hp,Wp = xp.shape
+            seq = xp.permute(0,2,3,4,1).reshape(B, Dp*Hp*Wp, C)
             seq = self._run_seq(seq)
-            y = seq.reshape(B, Dp, Hp, Wp, C).permute(0, 4, 1, 2, 3).contiguous()
-            # restore to original D,H,W
-            # inv_sp are indices of original spatial dims inside permuted tensor
-            # current y dims: [B,C,sp0,sp1,sp2] where sp0 corresponds to ax[0], etc
-            # we need permute back so that dims become [B,C,D,H,W]
-            # Build restore perm:
-            # y currently has spatial dims in order ax[0],ax[1],ax[2]
-            # We want order d,h,w => compute indices in current:
+            y = seq.reshape(B,Dp,Hp,Wp,C).permute(0,4,1,2,3).contiguous()
             cur = {'d': 2 + ax.index('d'), 'h': 2 + ax.index('h'), 'w': 2 + ax.index('w')}
-            y = y.permute(0, 1, cur['d'], cur['h'], cur['w']).contiguous()
+            y = y.permute(0,1,cur['d'],cur['h'],cur['w']).contiguous()
             outs.append(y)
-
-        out = torch.stack(outs, dim=0).mean(dim=0)
-        return out
-
+        return torch.stack(outs, dim=0).mean(dim=0)
 
 class MambaSnakeUNet3D(nn.Module):
-    """
-    4-down U-Net:
-      x0 full
-      x1 /2
-      x2 /4
-      x3 /8
-      x4 /16 (bottleneck grid)
-    """
-    def __init__(
-        self,
-        in_ch: int,
-        num_classes: int,
-        base: int = 32,
-        gn_groups: int = 16,
-        mamba_layers: int = 4,
-        mamba_axes: List[str] = ["dhw", "hwd", "wdh"],
-        snake_stages: Iterable[str] = ("u3", "u2"),  # lower-res only by default (VRAM!)
-        snake_k: int = 3,
-        checkpoint_bottleneck: bool = True,
-        deep_supervision: bool = True,
-    ):
+    def __init__(self, in_ch: int, num_classes: int, base: int, gn_groups: int, mamba_layers: int,
+                 mamba_axes: List[str], snake_stages: Iterable[str], snake_k: int,
+                 checkpoint_bottleneck: bool, checkpoint_decoder: bool,
+                 coord_inject_levels: str = "bottleneck,enc2,enc3"):
         super().__init__()
-        self.deep_supervision = bool(deep_supervision)
         self.checkpoint_bottleneck = bool(checkpoint_bottleneck)
+        self.coord_levels = set([t.strip() for t in coord_inject_levels.split(",") if t.strip()])
 
         self.stem = ConvBlock(in_ch, base, gn_groups)
-        self.d1 = Down(base, base * 2, gn_groups)
-        self.d2 = Down(base * 2, base * 4, gn_groups)
-        self.d3 = Down(base * 4, base * 8, gn_groups)
-        self.d4 = Down(base * 8, base * 16, gn_groups)
+        self.c0 = CoordInject3D(base) if "enc0" in self.coord_levels else nn.Identity()
+        self.d1 = Down(base, base*2, gn_groups)
+        self.c1 = CoordInject3D(base*2) if "enc1" in self.coord_levels else nn.Identity()
+        self.d2 = Down(base*2, base*4, gn_groups)
+        self.c2 = CoordInject3D(base*4) if "enc2" in self.coord_levels else nn.Identity()
+        self.d3 = Down(base*4, base*8, gn_groups)
+        self.c3 = CoordInject3D(base*8) if "enc3" in self.coord_levels else nn.Identity()
+        self.d4 = Down(base*8, base*16, gn_groups)
 
-        bott_dim = base * 16
-        self.bott_pre = ConvBlock(bott_dim, bott_dim, gn_groups)
-        self.mamba = nn.ModuleList([BiMambaSSM(bott_dim, axes=mamba_axes) for _ in range(int(mamba_layers))])
-        self.bott_post = ConvBlock(bott_dim, bott_dim, gn_groups)
+        bott = base*16
+        self.bpre = ConvBlock(bott, bott, gn_groups)
+        self.cb = CoordInject3D(bott) if "bottleneck" in self.coord_levels else nn.Identity()
+        self.mamba = nn.ModuleList([BiMambaSSM(bott, axes=mamba_axes) for _ in range(int(mamba_layers))])
+        self.bpost = ConvBlock(bott, bott, gn_groups)
 
         stages = set(snake_stages)
-        self.u4 = Up(bott_dim, base * 8,  base * 8,  use_snake=("u4" in stages), snake_k=snake_k, gn_groups=gn_groups)  # /8
-        self.u3 = Up(base * 8, base * 4,  base * 4,  use_snake=("u3" in stages), snake_k=snake_k, gn_groups=gn_groups)  # /4
-        self.u2 = Up(base * 4, base * 2,  base * 2,  use_snake=("u2" in stages), snake_k=snake_k, gn_groups=gn_groups)  # /2
-        self.u1 = Up(base * 2, base,      base,      use_snake=("u1" in stages), snake_k=snake_k, gn_groups=gn_groups)  # /1
+        self.u4 = Up(bott,    base*8, base*8, use_snake=("u4" in stages), snake_k=snake_k, gn_groups=gn_groups, checkpoint_block=checkpoint_decoder)
+        self.u3 = Up(base*8,  base*4, base*4, use_snake=("u3" in stages), snake_k=snake_k, gn_groups=gn_groups, checkpoint_block=checkpoint_decoder)
+        self.u2 = Up(base*4,  base*2, base*2, use_snake=("u2" in stages), snake_k=snake_k, gn_groups=gn_groups, checkpoint_block=checkpoint_decoder)
+        self.u1 = Up(base*2,  base,   base,   use_snake=("u1" in stages), snake_k=snake_k, gn_groups=gn_groups, checkpoint_block=checkpoint_decoder)
 
         self.head = nn.Conv3d(base, num_classes, 1)
+        self.aux2 = nn.Conv3d(base*2, num_classes, 1)
+        self.aux3 = nn.Conv3d(base*4, num_classes, 1)
+        self.aux4 = nn.Conv3d(base*8, num_classes, 1)
 
-        # deep supervision aux heads
-        self.aux2 = nn.Conv3d(base * 2, num_classes, 1)  # /2
-        self.aux3 = nn.Conv3d(base * 4, num_classes, 1)  # /4
-        self.aux4 = nn.Conv3d(base * 8, num_classes, 1)  # /8
-
-    def _run_bottleneck(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.bott_pre(x)
+    def _run_bottleneck(self, x):
+        x = self.bpre(x)
+        x = self.cb(x)
         if self.checkpoint_bottleneck and self.training:
             for blk in self.mamba:
                 x = checkpoint(blk, x, use_reentrant=False)
         else:
             for blk in self.mamba:
                 x = blk(x)
-        x = self.bott_post(x)
+        x = self.bpost(x)
         return x
 
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        x0 = self.stem(x)     # /1
-        x1 = self.d1(x0)      # /2
-        x2 = self.d2(x1)      # /4
-        x3 = self.d3(x2)      # /8
-        x4 = self.d4(x3)      # /16
+    def forward(self, x):
+        x0 = self.c0(self.stem(x))
+        x1 = self.c1(self.d1(x0))
+        x2 = self.c2(self.d2(x1))
+        x3 = self.c3(self.d3(x2))
+        x4 = self.d4(x3)
+        b  = self._run_bottleneck(x4)
 
-        b = self._run_bottleneck(x4)
-
-        y4 = self.u4(b, x3)   # /8
-        y3 = self.u3(y4, x2)  # /4
-        y2 = self.u2(y3, x1)  # /2
-        y1 = self.u1(y2, x0)  # /1
+        y4 = self.u4(b, x3)
+        y3 = self.u3(y4, x2)
+        y2 = self.u2(y3, x1)
+        y1 = self.u1(y2, x0)
 
         out = {"logits": self.head(y1)}
-        if self.training and self.deep_supervision:
-            out["aux2"] = self.aux2(y2)  # /2
-            out["aux3"] = self.aux3(y3)  # /4
-            out["aux4"] = self.aux4(y4)  # /8
+        if self.training:
+            out["aux2"] = self.aux2(y2)
+            out["aux3"] = self.aux3(y3)
+            out["aux4"] = self.aux4(y4)
         return out
 
 
 # -------------------------
-# Metrics
+# GPU geometric augmentation (optional + throttled)
 # -------------------------
-@torch.no_grad()
-def dice_fg(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1e-5) -> float:
-    # foreground dice for class 1 (binary)
-    if logits.shape[2:] != targets.shape[-3:]:
-        logits = F.interpolate(logits, size=targets.shape[-3:], mode="trilinear", align_corners=False)
+def gpu_geom_aug(
+    img: torch.Tensor,          # [B,1,D,H,W]
+    lab: torch.Tensor,          # [B,D,H,W]
+    rot_prob: float,
+    rot_deg: float,
+    elastic_prob: float,
+    elastic_alpha: float,
+    elastic_coarse: int,
+    do_elastic: bool,
+):
+    assert img.ndim == 5, f"img must be [B,C,D,H,W], got {img.shape}"
+    B, C, D, H, W = img.shape
+    device = img.device
+    dtype_grid = torch.float32
+
+    lab_in = lab.unsqueeze(1).float()
+
+    grid = _make_grid_for_sample(B, D, H, W, device=device, dtype=dtype_grid)
+
+    # --- Rotation ---
+    if rot_prob > 0 and torch.rand((), device=device) < rot_prob:
+        deg = float(rot_deg)
+        ax = (torch.rand((), device=device) * 2 - 1) * deg * (math.pi / 180.0)
+        ay = (torch.rand((), device=device) * 2 - 1) * deg * (math.pi / 180.0)
+        az = (torch.rand((), device=device) * 2 - 1) * deg * (math.pi / 180.0)
+
+        cx, sx = torch.cos(ax), torch.sin(ax)
+        cy, sy = torch.cos(ay), torch.sin(ay)
+        cz, sz = torch.cos(az), torch.sin(az)
+
+        Rx = torch.tensor([[1,0,0],[0,cx,-sx],[0,sx,cx]], device=device, dtype=dtype_grid)
+        Ry = torch.tensor([[cy,0,sy],[0,1,0],[-sy,0,cy]], device=device, dtype=dtype_grid)
+        Rz = torch.tensor([[cz,-sz,0],[sz,cz,0],[0,0,1]], device=device, dtype=dtype_grid)
+        R = (Rz @ Ry @ Rx).unsqueeze(0).repeat(B, 1, 1)  # [B,3,3]
+
+        g = grid.view(B, -1, 3)
+        g = torch.bmm(g, R.transpose(1, 2))
+        grid = g.view(B, D, H, W, 3)
+
+    # --- Elastic deformation (expensive) ---
+    if do_elastic and elastic_prob > 0 and torch.rand((), device=device) < elastic_prob:
+        coarse = int(max(2, elastic_coarse))
+        dc = max(2, D // coarse)
+        hc = max(2, H // coarse)
+        wc = max(2, W // coarse)
+
+        disp_c = torch.randn((B, 3, dc, hc, wc), device=device, dtype=dtype_grid)
+        disp = F.interpolate(disp_c, size=(D, H, W), mode="trilinear", align_corners=True)
+
+        sx = (2.0 / max(1, W - 1)) * float(elastic_alpha)
+        sy = (2.0 / max(1, H - 1)) * float(elastic_alpha)
+        sz = (2.0 / max(1, D - 1)) * float(elastic_alpha)
+
+        disp[:, 0] *= sx
+        disp[:, 1] *= sy
+        disp[:, 2] *= sz
+
+        disp = disp.permute(0, 2, 3, 4, 1).contiguous()
+        grid = grid + disp
+
+    img_aug = F.grid_sample(img.float(), grid, mode="bilinear", padding_mode="border", align_corners=True).to(dtype=img.dtype)
+    lab_aug = F.grid_sample(lab_in, grid, mode="nearest", padding_mode="border", align_corners=True)[:, 0].long()
+    return img_aug, lab_aug
+
+
+# -------------------------
+# Sliding-window inference
+# -------------------------
+_WEIGHT_CACHE: Dict[Tuple[int, int, int, str, str], torch.Tensor] = {}
+
+def _make_blend_weight_3d(patch_dhw: Tuple[int,int,int], device: torch.device, kind: str) -> torch.Tensor:
+    key = (patch_dhw[0],patch_dhw[1],patch_dhw[2],kind,str(device))
+    w = _WEIGHT_CACHE.get(key, None)
+    if w is not None:
+        return w
+    pd,ph,pw = patch_dhw
+    if kind == "hann":
+        wd = torch.hann_window(pd, periodic=False, device=device, dtype=torch.float32).clamp_min(1e-3)
+        wh = torch.hann_window(ph, periodic=False, device=device, dtype=torch.float32).clamp_min(1e-3)
+        ww = torch.hann_window(pw, periodic=False, device=device, dtype=torch.float32).clamp_min(1e-3)
+    else:
+        def gauss(n, sigma_frac=0.125):
+            x = torch.linspace(-1,1,n,device=device,dtype=torch.float32)
+            g = torch.exp(-0.5*(x/(sigma_frac))**2)
+            return g.clamp_min(1e-3)
+        wd=gauss(pd); wh=gauss(ph); ww=gauss(pw)
+    w3 = (wd[:,None,None]*wh[None,:,None]*ww[None,None,:])
+    w3 = (w3 / w3.max().clamp_min(1e-6)).contiguous()
+    w = w3[None,None]  # [1,1,D,H,W]
+    _WEIGHT_CACHE[key]=w
+    return w
+
+def _safe_pad3d(img: torch.Tensor, halo: int) -> torch.Tensor:
+    if halo <= 0:
+        return img
+    pad = [halo,halo,halo,halo,halo,halo]
+    try:
+        return F.pad(img, pad, mode="reflect")
+    except Exception:
+        return F.pad(img, pad, mode="replicate")
+
+def _make_starts(L: int, P: int, stride: int) -> List[int]:
+    max0 = max(0, L-P)
+    if max0 == 0:
+        return [0]
+    s = list(range(0, max0+1, stride))
+    if s[-1] != max0:
+        s.append(max0)
+    return s
+
+@torch.inference_mode()
+def sliding_window_logits(model: nn.Module, img: torch.Tensor, patch: Tuple[int,int,int],
+                          overlap: float, halo: int, blend: str,
+                          amp: bool, amp_dtype: torch.dtype) -> torch.Tensor:
+    _,_,D0,H0,W0 = img.shape
+    pd,ph,pw = patch
+
+    pad_d = max(0, pd - D0)
+    pad_h = max(0, ph - H0)
+    pad_w = max(0, pw - W0)
+    if pad_d or pad_h or pad_w:
+        img = F.pad(img, [pad_w//2, pad_w-pad_w//2, pad_h//2, pad_h-pad_h//2, pad_d//2, pad_d-pad_d//2])
+
+    _,_,D,H,W = img.shape
+    imgp = _safe_pad3d(img, halo)
+
+    sd = max(1, int(pd*(1.0-overlap)))
+    sh = max(1, int(ph*(1.0-overlap)))
+    sw = max(1, int(pw*(1.0-overlap)))
+
+    dzs = _make_starts(D, pd, sd)
+    hzs = _make_starts(H, ph, sh)
+    wzs = _make_starts(W, pw, sw)
+
+    weight = _make_blend_weight_3d((pd,ph,pw), img.device, blend)
+    out = None
+    wsum = torch.zeros((1,1,D,H,W), device=img.device, dtype=torch.float32)
+
+    for dz in dzs:
+        for hy in hzs:
+            for wx in wzs:
+                patch_ext = imgp[:,:, dz:dz+pd+2*halo, hy:hy+ph+2*halo, wx:wx+pw+2*halo]
+                with torch.amp.autocast(device_type="cuda", enabled=amp, dtype=amp_dtype):
+                    logits_ext = model(patch_ext)["logits"].float()
+                logits = logits_ext[:,:, halo:halo+pd, halo:halo+ph, halo:halo+pw] if halo>0 else logits_ext
+                if out is None:
+                    out = torch.zeros((1, logits.shape[1], D,H,W), device=img.device, dtype=torch.float32)
+                out[:,:,dz:dz+pd, hy:hy+ph, wx:wx+pw] += logits * weight
+                wsum[:,:,dz:dz+pd, hy:hy+ph, wx:wx+pw] += weight
+
+    out = out / wsum.clamp_min(1e-6)
+
+    if pad_d or pad_h or pad_w:
+        dd0 = pad_d//2; hh0 = pad_h//2; ww0 = pad_w//2
+        out = out[:,:, dd0:dd0+D0, hh0:hh0+H0, ww0:ww0+W0]
+    return out
+
+
+# -------------------------
+# Post-processing + metrics
+# -------------------------
+def remove_small_components_3d(mask: np.ndarray, min_vox: int = 0, min_rel: float = 0.001) -> np.ndarray:
+    if not _HAS_SCIPY:
+        return mask
+    lab, n = ndi.label(mask.astype(bool), structure=np.ones((3,3,3), dtype=np.uint8))
+    if n <= 0:
+        return mask
+    sizes = np.bincount(lab.ravel())
+    sizes[0] = 0
+    largest = int(sizes.max()) if sizes.size else 0
+    thr_rel = int(math.ceil(float(min_rel) * largest)) if (min_rel and largest > 0) else 0
+    thr = max(int(min_vox), thr_rel)
+    keep = sizes >= thr
+    keep[0] = False
+    return keep[lab].astype(np.uint8)
+
+@torch.inference_mode()
+def dice_fg_from_logits(logits: torch.Tensor, targets: torch.Tensor, eps: float=1e-5) -> float:
     probs = torch.softmax(logits.float(), dim=1)
     pred = (torch.argmax(probs, dim=1) > 0).float()
-    tgt = (targets > 0).float()
-    inter = (pred * tgt).sum()
+    tgt  = (targets > 0).float()
+    inter = (pred*tgt).sum()
     den = pred.sum() + tgt.sum()
-    return float(((2 * inter + eps) / (den + eps)).item())
+    return float(((2*inter+eps)/(den+eps)).item())
+
+@torch.inference_mode()
+def cldice_from_logits(logits: torch.Tensor, targets: torch.Tensor, iters: int = 20) -> float:
+    probs = torch.softmax(logits.float(), dim=1)[:,1:2]
+    tgt = (targets>0).float().unsqueeze(1)
+    cl = SoftclDiceLoss(iters=iters)(probs, tgt)
+    return float((1.0 - cl).item())
+
+def hd95_binary(pred: np.ndarray, gt: np.ndarray) -> float:
+    pred = pred.astype(bool); gt = gt.astype(bool)
+    if pred.sum() == 0 and gt.sum() == 0:
+        return 0.0
+    if pred.sum() == 0 or gt.sum() == 0:
+        return float(max(pred.shape))
+    if _HAS_MONAI:
+        p = torch.from_numpy(pred[None,None].astype(np.float32))
+        g = torch.from_numpy(gt[None,None].astype(np.float32))
+        metric = HausdorffDistanceMetric(include_background=True, percentile=95.0, directed=False)
+        v = metric(p, g)
+        return float(v.item())
+    if not _HAS_SCIPY:
+        return float("nan")
+    er_p = ndi.binary_erosion(pred, structure=np.ones((3,3,3), bool), iterations=1)
+    er_g = ndi.binary_erosion(gt, structure=np.ones((3,3,3), bool), iterations=1)
+    sp = pred & (~er_p)
+    sg = gt & (~er_g)
+    if sp.sum()==0 or sg.sum()==0:
+        return float(max(pred.shape))
+    dt_g = ndi.distance_transform_edt(~sg)
+    dt_p = ndi.distance_transform_edt(~sp)
+    d = np.concatenate([dt_g[sp], dt_p[sg]], axis=0)
+    return float(np.percentile(d, 95))
 
 
 # -------------------------
-# Schedules (warmup + cosine + loss schedules)
+# Config
+# -------------------------
+@dataclass
+class TrainConfig:
+    cache_dir: Path
+    out_dir: Path
+    sampling_db_dir: Optional[Path]
+
+    gpu: int = 0
+    val_gpu: int = 1
+
+    epochs: int = 220
+    epoch_size: int = 1024  # iterations per epoch (replacement sampler)
+
+    batch_size: int = 1
+    accum_steps: int = 2
+    num_workers: int = 8
+    seed: int = 42
+
+    patch_size: Tuple[int,int,int] = (160,160,160)
+    val_patch_size: Tuple[int,int,int] = (128,128,128)
+
+    lr: float = 2e-4
+    weight_decay: float = 1e-2
+    warmup_epochs: int = 10
+    grad_clip: float = 0.8
+
+    amp: bool = True
+    amp_dtype: str = "bf16"
+
+    pos_ratio: float = 0.50
+    bg_hard_prob: float = 0.70
+    ram_cache_items: int = 0
+    center_jitter_prob: float = 0.75
+    center_jitter_frac: float = 0.30
+
+    # GPU geom aug
+    rot_prob: float = 0.10
+    rot_deg: float = 10.0
+    elastic_prob: float = 0.05
+    elastic_alpha: float = 2.0
+    elastic_coarse: int = 5
+    elastic_every: int = 1
+
+    # model
+    base_ch: int = 32
+    gn_groups: int = 16
+    mamba_layers: int = 4
+    mamba_axes: Tuple[str,...] = ("dhw","hwd","wdh")
+    snake_stages: Tuple[str,...] = ("u3","u2")
+    snake_k: int = 3
+    checkpoint_bottleneck: bool = True
+    checkpoint_decoder: bool = False
+    coord_inject_levels: str = "bottleneck,enc2,enc3"
+
+    # deep supervision
+    ds_w2: float = 0.50
+    ds_w3: float = 0.25
+    ds_w4: float = 0.125
+    ds_decay_start: int = 150
+    ds_decay_end: int = 220
+
+    # validation scheduling
+    val_full: bool = True
+    val_full_max: int = 4
+    val_interval: int = 10
+
+    # dynamic overlap schedule
+    val_overlap_early: float = 0.25
+    val_overlap_late: float = 0.55
+    val_overlap_switch: int = 150
+
+    val_halo: int = 16
+    blend_window: str = "hann"
+    val_rm_small: bool = True
+    val_min_cc_vox: int = 0
+    val_min_cc_rel: float = 0.001
+
+    # HD95 scheduling
+    hd95_start: int = 100
+
+    # clDice selection
+    select_w_dice: float = 0.50
+    select_w_cldice: float = 0.50
+    select_cl_iters: int = 20
+
+    # loss schedule
+    cldice_ramp_e0: int = 30
+
+
+# -------------------------
+# LR schedule
 # -------------------------
 def cosine_with_warmup(step: int, total_steps: int, warmup_steps: int, base_lr: float) -> float:
     if warmup_steps > 0 and step < warmup_steps:
@@ -816,107 +1140,6 @@ def cosine_with_warmup(step: int, total_steps: int, warmup_steps: int, base_lr: 
     t = min(max(t, 0.0), 1.0)
     return base_lr * 0.5 * (1.0 + math.cos(math.pi * t))
 
-
-def linear_schedule(epoch: int, e0: int, e1: int, v0: float, v1: float) -> float:
-    if epoch <= e0:
-        return float(v0)
-    if epoch >= e1:
-        return float(v1)
-    t = (epoch - e0) / max(1, (e1 - e0))
-    return float(v0 + t * (v1 - v0))
-
-
-# -------------------------
-# Train config
-# -------------------------
-@dataclass
-class TrainConfig:
-    cache_dir: Path
-    out_dir: Path
-
-    num_classes: int = 2
-    epochs: int = 300
-
-    patch_size: Tuple[int, int, int] = (160, 160, 160)
-    batch_size: int = 1
-    accum_steps: int = 2
-    num_workers: int = 8
-
-    base_lr: float = 2e-4
-    weight_decay: float = 1e-2
-    warmup_epochs: int = 10
-
-    seed: int = 42
-    gpu: int = 0
-
-    amp: bool = True
-    amp_dtype: str = "bf16"  # "bf16" or "fp16"
-
-    # model
-    base_ch: int = 32
-    gn_groups: int = 16
-    mamba_layers: int = 4
-    mamba_axes: List[str] = None
-    snake_stages: Set[str] = None
-    snake_k: int = 3
-    checkpoint_bottleneck: bool = True
-    deep_supervision: bool = True
-
-    # sampling
-    pos_ratio: float = 0.97
-    min_fg_voxels: int = 256
-    ram_cache_items: int = 0
-
-    # loss weights
-    w_tversky: float = 0.55
-    w_dice: float = 0.20
-    w_ce: float = 0.15
-    w_bnd: float = 0.10
-
-    # clDice scheduled
-    w_cldice_start: float = 0.00
-    w_cldice_end: float = 0.20
-    cldice_iters_start: int = 6
-    cldice_iters_end: int = 18
-    cldice_ramp_e0: int = 30
-    cldice_ramp_e1: int = 140
-
-    # CE fg weight scheduled
-    ce_w_fg_start: float = 12.0
-    ce_w_fg_end: float = 5.0
-    ce_ramp_e0: int = 10
-    ce_ramp_e1: int = 80
-
-    alpha: float = 0.3
-    beta: float = 0.7
-    include_background_losses: bool = False
-
-    grad_clip: float = 0.8
-    ema: float = 0.0  # keep 0 by default (EMA costs memory/time)
-
-
-class EMA:
-    def __init__(self, model: nn.Module, decay: float = 0.999):
-        self.decay = float(decay)
-        self.shadow: Dict[str, torch.Tensor] = {}
-        for n, p in model.named_parameters():
-            if p.requires_grad:
-                self.shadow[n] = p.detach().clone()
-
-    @torch.no_grad()
-    def update(self, model: nn.Module):
-        d = self.decay
-        for n, p in model.named_parameters():
-            if n in self.shadow:
-                self.shadow[n].mul_(d).add_(p.detach(), alpha=(1.0 - d))
-
-    @torch.no_grad()
-    def copy_to(self, model: nn.Module):
-        for n, p in model.named_parameters():
-            if n in self.shadow:
-                p.data.copy_(self.shadow[n].data)
-
-
 def _grads_finite(model: nn.Module) -> bool:
     for p in model.parameters():
         if p.grad is not None and not torch.isfinite(p.grad).all():
@@ -924,63 +1147,52 @@ def _grads_finite(model: nn.Module) -> bool:
     return True
 
 
-def _autocast_dtype(name: str) -> torch.dtype:
-    name = name.lower()
-    if name == "bf16":
-        return torch.bfloat16
-    if name == "fp16":
-        return torch.float16
-    raise ValueError("amp dtype must be bf16 or fp16")
-
-
-def train_one_epoch(
-    model: nn.Module,
-    loader: torch.utils.data.DataLoader,
-    optimizer: torch.optim.Optimizer,
-    scaler: Optional[torch.amp.GradScaler],
-    loss_obj: TubularLoss,
-    cfg: TrainConfig,
-    epoch: int,
-    global_step: int,
-    total_steps: int,
-) -> Tuple[float, int]:
+# -------------------------
+# Train/Val
+# -------------------------
+def train_one_epoch(model, loader, optimizer, scaler, loss_obj: TubularLoss, cfg: TrainConfig,
+                    epoch: int, global_step: int, total_steps: int) -> Tuple[float,int]:
     model.train()
-    total = 0.0
-    n = 0
+    total=0.0; n=0
     optimizer.zero_grad(set_to_none=True)
-
     amp_dtype = _autocast_dtype(cfg.amp_dtype)
+    warmup_steps = cfg.warmup_epochs * len(loader)
+
+    w2,w3,w4 = deep_sup_weights(epoch, cfg.ds_decay_start, cfg.ds_decay_end, cfg.ds_w2, cfg.ds_w3, cfg.ds_w4)
 
     for step, batch in enumerate(loader, start=1):
         img = batch["image"].cuda(non_blocking=True)
         lab = batch["label"].cuda(non_blocking=True).long()
 
-        # update LR per step (warmup+cosine)
-        lr = cosine_with_warmup(global_step, total_steps, cfg.warmup_epochs * len(loader), cfg.base_lr)
+        # Throttle elastic augmentation if desired
+        do_elastic = (cfg.elastic_every <= 1) or ((global_step % cfg.elastic_every) == 0)
+        img, lab = gpu_geom_aug(
+            img, lab,
+            cfg.rot_prob, cfg.rot_deg,
+            cfg.elastic_prob, cfg.elastic_alpha, cfg.elastic_coarse,
+            do_elastic=do_elastic
+        )
+
+        lr = cosine_with_warmup(global_step, total_steps, warmup_steps, cfg.lr)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
         with torch.amp.autocast(device_type="cuda", enabled=cfg.amp, dtype=amp_dtype):
-            outputs = model(img)
-            logits = outputs["logits"]
-            loss_main = loss_obj(logits, lab)
+            out = model(img)
+            loss_main = loss_obj(out["logits"], lab)
+            loss = loss_main
 
-            # deep supervision
-            if ("aux2" in outputs) and ("aux3" in outputs) and ("aux4" in outputs):
-                lab2 = F.interpolate(lab.unsqueeze(1).float(), scale_factor=0.5, mode="nearest").squeeze(1).long()
-                lab3 = F.interpolate(lab.unsqueeze(1).float(), scale_factor=0.25, mode="nearest").squeeze(1).long()
-                lab4 = F.interpolate(lab.unsqueeze(1).float(), scale_factor=0.125, mode="nearest").squeeze(1).long()
-                loss2 = loss_obj(outputs["aux2"], lab2)
-                loss3 = loss_obj(outputs["aux3"], lab3)
-                loss4 = loss_obj(outputs["aux4"], lab4)
-                loss = loss_main + 0.5 * loss2 + 0.25 * loss3 + 0.125 * loss4
-            else:
-                loss = loss_main
+            if w2>0 or w3>0 or w4>0:
+                lab2 = downsample_label_maxpool(lab, factor=2)
+                lab3 = downsample_label_maxpool(lab, factor=4)
+                lab4 = downsample_label_maxpool(lab, factor=8)
+                loss = loss + w2 * loss_obj(out["aux2"], lab2)
+                loss = loss + w3 * loss_obj(out["aux3"], lab3)
+                loss = loss + w4 * loss_obj(out["aux4"], lab4)
 
             loss = loss / max(1, cfg.accum_steps)
 
         if not torch.isfinite(loss):
-            print("[WARN] non-finite loss; skipping batch.")
             optimizer.zero_grad(set_to_none=True)
             if scaler is not None:
                 scaler.update()
@@ -995,59 +1207,123 @@ def train_one_epoch(
         if (step % cfg.accum_steps) == 0:
             if scaler is not None:
                 scaler.unscale_(optimizer)
-
             if not _grads_finite(model):
-                print("[WARN] non-finite grads; skipping optimizer step.")
                 optimizer.zero_grad(set_to_none=True)
                 if scaler is not None:
                     scaler.update()
                 global_step += 1
                 continue
-
             if cfg.grad_clip and cfg.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-
             if scaler is not None:
-                scaler.step(optimizer)
-                scaler.update()
+                scaler.step(optimizer); scaler.update()
             else:
                 optimizer.step()
-
             optimizer.zero_grad(set_to_none=True)
 
         total += float(loss.item()) * max(1, cfg.accum_steps)
         n += 1
         global_step += 1
 
-    return total / max(1, n), global_step
+    return total/max(1,n), global_step
 
-
-@torch.no_grad()
-def validate_patchwise(
-    model: nn.Module,
-    loader: torch.utils.data.DataLoader,
-    loss_obj: TubularLoss,
-    cfg: TrainConfig,
-) -> Tuple[float, float]:
+@torch.inference_mode()
+def validate_patchwise(model, loader, loss_obj: TubularLoss, cfg: TrainConfig) -> Dict[str,float]:
     model.eval()
-    total = 0.0
-    n = 0
-    dfg = 0.0
     amp_dtype = _autocast_dtype(cfg.amp_dtype)
-
+    total=0.0; dfg=0.0; n=0
     for batch in loader:
         img = batch["image"].cuda(non_blocking=True)
         lab = batch["label"].cuda(non_blocking=True).long()
-
         with torch.amp.autocast(device_type="cuda", enabled=cfg.amp, dtype=amp_dtype):
-            outputs = model(img)
-            loss = loss_obj(outputs["logits"], lab)
-
+            out = model(img)
+            loss = loss_obj(out["logits"], lab)
         total += float(loss.item())
-        dfg += dice_fg(outputs["logits"], lab)
+        dfg += dice_fg_from_logits(out["logits"], lab)
         n += 1
+    return {"val_loss": total/max(1,n), "val_fg_dice": dfg/max(1,n)}
 
-    return (total / max(1, n)), (dfg / max(1, n))
+
+def validate_full_worker(payload: Dict[str,Any], q):
+    """
+    Spawned worker runs full-volume validation on cfg.val_gpu.
+    Returns dict with metrics + epoch_id.
+    """
+    cfgd = payload["cfg"]
+    cfg = TrainConfig(**cfgd)
+    ckpt_path = Path(payload["ckpt_path"])
+    items = payload["val_items"]
+    epoch_id = int(payload["epoch_id"])
+
+    # Device safety
+    dev_count = torch.cuda.device_count()
+    if int(cfg.val_gpu) < 0 or int(cfg.val_gpu) >= dev_count:
+        q.put({"epoch_id": epoch_id, "error": f"val_gpu {cfg.val_gpu} invalid; visible device_count={dev_count}"})
+        return
+
+    torch.cuda.set_device(int(cfg.val_gpu))
+    device = torch.device(f"cuda:{int(cfg.val_gpu)}")
+    enable_perf_flags(tf32=True, cudnn_benchmark=True)
+    amp_dtype = _autocast_dtype(cfg.amp_dtype)
+
+    model = MambaSnakeUNet3D(
+        in_ch=1, num_classes=2, base=cfg.base_ch, gn_groups=cfg.gn_groups,
+        mamba_layers=cfg.mamba_layers, mamba_axes=list(cfg.mamba_axes),
+        snake_stages=cfg.snake_stages, snake_k=cfg.snake_k,
+        checkpoint_bottleneck=False, checkpoint_decoder=False,
+        coord_inject_levels=cfg.coord_inject_levels,
+    ).to(device)
+
+    sd = torch.load(ckpt_path, map_location="cpu")["model"]
+    model.load_state_dict(sd, strict=True)
+    model.eval()
+
+    # overlap schedule
+    overlap = cfg.val_overlap_early if epoch_id < cfg.val_overlap_switch else cfg.val_overlap_late
+    compute_hd95 = (epoch_id >= cfg.hd95_start)
+
+    dices=[]; clds=[]; hd95s=[]
+    m = min(int(cfg.val_full_max), len(items))
+    for i in range(m):
+        it = items[i]
+        uid = it["uid"]
+        ip = _resolve_cached_path(uid, it["image_pt"], Path(cfg.cache_dir), "image")
+        lp = _resolve_cached_path(uid, it["label_pt"], Path(cfg.cache_dir), "label")
+        img = torch.load(ip, map_location="cpu").float()  # [1,D,H,W]
+        lab = torch.load(lp, map_location="cpu")
+        lab = (lab>0).to(torch.uint8)
+
+        img = img.unsqueeze(0).to(device, non_blocking=True)              # [1,1,D,H,W]
+        labt = lab.unsqueeze(0).to(device, non_blocking=True).long()      # [1,D,H,W]
+
+        logits = sliding_window_logits(
+            model, img, cfg.val_patch_size, overlap, cfg.val_halo, cfg.blend_window,
+            cfg.amp, amp_dtype
+        )
+
+        d = dice_fg_from_logits(logits, labt)
+        c = cldice_from_logits(logits, labt, iters=cfg.select_cl_iters)
+        dices.append(d); clds.append(c)
+
+        if compute_hd95:
+            probs = torch.softmax(logits.float(), dim=1)
+            pred = (torch.argmax(probs, dim=1) > 0).detach().cpu().numpy().astype(np.uint8)[0]
+            gt   = (lab.numpy() > 0).astype(np.uint8)
+            if cfg.val_rm_small and _HAS_SCIPY and (cfg.val_min_cc_rel>0 or cfg.val_min_cc_vox>0):
+                pred = remove_small_components_3d(pred, min_vox=cfg.val_min_cc_vox, min_rel=cfg.val_min_cc_rel)
+            hd95s.append(hd95_binary(pred, gt))
+
+        torch.cuda.empty_cache()
+
+    out = {
+        "epoch_id": epoch_id,
+        "val_full_fg_dice": float(np.mean(dices)) if dices else float("nan"),
+        "val_full_fg_cldice": float(np.mean(clds)) if clds else float("nan"),
+        "val_full_hd95": float(np.mean(hd95s)) if (compute_hd95 and hd95s) else float("nan"),
+        "val_full_overlap_used": float(overlap),
+        "val_full_hd95_enabled": bool(compute_hd95),
+    }
+    q.put(out)
 
 
 # -------------------------
@@ -1055,71 +1331,89 @@ def validate_patchwise(
 # -------------------------
 def main():
     ap = argparse.ArgumentParser()
+
     ap.add_argument("--cache-dir", type=Path, required=True)
     ap.add_argument("--out-dir", type=Path, required=True)
+    ap.add_argument("--sampling-db-dir", type=Path, default=None)
 
-    ap.add_argument("--epochs", type=int, default=300)
-    ap.add_argument("--patch-size", type=int, nargs=3, default=[160, 160, 160])
+    ap.add_argument("--gpu", type=int, default=0)
+    ap.add_argument("--val-gpu", type=int, default=1)
+
+    ap.add_argument("--epochs", type=int, default=220)
+    ap.add_argument("--epoch-size", type=int, default=1024)
+
+    ap.add_argument("--patch-size", type=int, nargs=3, default=[160,160,160])
+    ap.add_argument("--val-patch-size", type=int, nargs=3, default=[128,128,128])
+
     ap.add_argument("--batch-size", type=int, default=1)
     ap.add_argument("--accum-steps", type=int, default=2)
     ap.add_argument("--num-workers", type=int, default=8)
+    ap.add_argument("--seed", type=int, default=42)
 
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--weight-decay", type=float, default=1e-2)
     ap.add_argument("--warmup-epochs", type=int, default=10)
+    ap.add_argument("--grad-clip", type=float, default=0.8)
 
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--gpu", type=int, default=0)
-
+    ap.add_argument("--amp-dtype", choices=["bf16","fp16"], default="bf16")
     ap.add_argument("--no-amp", action="store_true")
-    ap.add_argument("--amp-dtype", type=str, choices=["bf16", "fp16"], default="bf16")
+
+    ap.add_argument("--pos-ratio", type=float, default=0.50)
+    ap.add_argument("--bg-hard-prob", type=float, default=0.70)
+
+    ap.add_argument("--ram-cache-items", type=int, default=0)
+    ap.add_argument("--center-jitter-prob", type=float, default=0.75)
+    ap.add_argument("--center-jitter-frac", type=float, default=0.30)
+
+    ap.add_argument("--rot-prob", type=float, default=0.10)
+    ap.add_argument("--rot-deg", type=float, default=10.0)
+    ap.add_argument("--elastic-prob", type=float, default=0.05)
+    ap.add_argument("--elastic-alpha", type=float, default=2.0)
+    ap.add_argument("--elastic-coarse", type=int, default=5)
+    ap.add_argument("--elastic-every", type=int, default=1)
 
     ap.add_argument("--base-ch", type=int, default=32)
     ap.add_argument("--gn-groups", type=int, default=16)
     ap.add_argument("--mamba-layers", type=int, default=4)
     ap.add_argument("--mamba-axes", type=str, default="dhw,hwd,wdh")
-
-    ap.add_argument("--snake-stages", type=str, default="u3,u2", help="Use snake at these decoder stages (u4,u3,u2,u1).")
+    ap.add_argument("--snake-stages", type=str, default="u3,u2")
     ap.add_argument("--snake-k", type=int, default=3)
+    ap.add_argument("--checkpoint-decoder", action="store_true")
     ap.add_argument("--no-checkpoint-bottleneck", action="store_true")
-    ap.add_argument("--no-deep-supervision", action="store_true")
+    ap.add_argument("--coord-inject-levels", type=str, default="bottleneck,enc2,enc3")
 
-    ap.add_argument("--pos-ratio", type=float, default=0.97)
-    ap.add_argument("--min-fg-voxels", type=int, default=256)
-    ap.add_argument("--ram-cache-items", type=int, default=0)
+    ap.add_argument("--ds-decay-start", type=int, default=150)
+    ap.add_argument("--ds-decay-end", type=int, default=220)
 
-    ap.add_argument("--w-tversky", type=float, default=0.55)
-    ap.add_argument("--w-dice", type=float, default=0.20)
-    ap.add_argument("--w-ce", type=float, default=0.15)
-    ap.add_argument("--w-bnd", type=float, default=0.10)
+    # validation scheduling
+    ap.add_argument("--val-full", action="store_true")
+    ap.add_argument("--val-full-max", type=int, default=4)
+    ap.add_argument("--val-interval", type=int, default=10)
 
-    ap.add_argument("--w-cldice-start", type=float, default=0.00)
-    ap.add_argument("--w-cldice-end", type=float, default=0.20)
-    ap.add_argument("--cldice-iters-start", type=int, default=6)
-    ap.add_argument("--cldice-iters-end", type=int, default=18)
+    ap.add_argument("--val-overlap-early", type=float, default=0.25)
+    ap.add_argument("--val-overlap-late", type=float, default=0.55)
+    ap.add_argument("--val-overlap-switch", type=int, default=150)
+
+    ap.add_argument("--val-halo", type=int, default=16)
+    ap.add_argument("--blend-window", choices=["hann","gaussian"], default="hann")
+    ap.add_argument("--val-rm-small", action="store_true")
+    ap.add_argument("--val-min-cc-vox", type=int, default=0)
+    ap.add_argument("--val-min-cc-rel", type=float, default=0.001)
+
+    ap.add_argument("--hd95-start", type=int, default=100)
+
     ap.add_argument("--cldice-ramp-e0", type=int, default=30)
-    ap.add_argument("--cldice-ramp-e1", type=int, default=140)
-
-    ap.add_argument("--ce-w-fg-start", type=float, default=12.0)
-    ap.add_argument("--ce-w-fg-end", type=float, default=5.0)
-    ap.add_argument("--ce-ramp-e0", type=int, default=10)
-    ap.add_argument("--ce-ramp-e1", type=int, default=80)
-
-    ap.add_argument("--alpha", type=float, default=0.3)
-    ap.add_argument("--beta", type=float, default=0.7)
-
-    ap.add_argument("--grad-clip", type=float, default=0.8)
-
-    ap.add_argument("--tf32", action="store_true")
-    ap.add_argument("--no-cudnn-benchmark", action="store_true")
 
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA not available")
 
-    enable_perf_flags(tf32=bool(args.tf32), cudnn_benchmark=(not args.no_cudnn_benchmark))
     seed_everything(int(args.seed))
+    enable_perf_flags(tf32=True, cudnn_benchmark=True)
+
+    dev_count = torch.cuda.device_count()
+    print(f"[info] torch.cuda.device_count()={dev_count}", flush=True)
 
     torch.cuda.set_device(int(args.gpu))
     device = torch.device(f"cuda:{int(args.gpu)}")
@@ -1127,175 +1421,267 @@ def main():
     cfg = TrainConfig(
         cache_dir=args.cache_dir,
         out_dir=args.out_dir,
+        sampling_db_dir=args.sampling_db_dir,
+        gpu=int(args.gpu),
+        val_gpu=int(args.val_gpu),
         epochs=int(args.epochs),
-        patch_size=tuple(int(x) for x in args.patch_size),
+        epoch_size=int(args.epoch_size),
         batch_size=int(args.batch_size),
-        accum_steps=max(1, int(args.accum_steps)),
+        accum_steps=max(1,int(args.accum_steps)),
         num_workers=int(args.num_workers),
-        base_lr=float(args.lr),
+        seed=int(args.seed),
+        patch_size=tuple(int(x) for x in args.patch_size),
+        val_patch_size=tuple(int(x) for x in args.val_patch_size),
+        lr=float(args.lr),
         weight_decay=float(args.weight_decay),
         warmup_epochs=int(args.warmup_epochs),
-        seed=int(args.seed),
-        gpu=int(args.gpu),
+        grad_clip=float(args.grad_clip),
         amp=(not args.no_amp),
         amp_dtype=str(args.amp_dtype),
+        pos_ratio=float(args.pos_ratio),
+        bg_hard_prob=float(args.bg_hard_prob),
+        ram_cache_items=int(args.ram_cache_items),
+        center_jitter_prob=float(args.center_jitter_prob),
+        center_jitter_frac=float(args.center_jitter_frac),
+        rot_prob=float(args.rot_prob),
+        rot_deg=float(args.rot_deg),
+        elastic_prob=float(args.elastic_prob),
+        elastic_alpha=float(args.elastic_alpha),
+        elastic_coarse=int(args.elastic_coarse),
+        elastic_every=max(1,int(args.elastic_every)),
         base_ch=int(args.base_ch),
         gn_groups=int(args.gn_groups),
         mamba_layers=int(args.mamba_layers),
-        mamba_axes=_parse_mamba_axes(args.mamba_axes),
-        snake_stages=_parse_stages(args.snake_stages) if args.snake_stages.strip().lower() != "none" else set(),
+        mamba_axes=tuple(_parse_mamba_axes(args.mamba_axes)),
+        snake_stages=tuple(sorted(list(_parse_stages(args.snake_stages)))),
         snake_k=int(args.snake_k),
         checkpoint_bottleneck=(not args.no_checkpoint_bottleneck),
-        deep_supervision=(not args.no_deep_supervision),
-        pos_ratio=float(args.pos_ratio),
-        min_fg_voxels=int(args.min_fg_voxels),
-        ram_cache_items=int(args.ram_cache_items),
-        w_tversky=float(args.w_tversky),
-        w_dice=float(args.w_dice),
-        w_ce=float(args.w_ce),
-        w_bnd=float(args.w_bnd),
-        w_cldice_start=float(args.w_cldice_start),
-        w_cldice_end=float(args.w_cldice_end),
-        cldice_iters_start=int(args.cldice_iters_start),
-        cldice_iters_end=int(args.cldice_iters_end),
+        checkpoint_decoder=bool(args.checkpoint_decoder),
+        coord_inject_levels=str(args.coord_inject_levels),
+        ds_decay_start=int(args.ds_decay_start),
+        ds_decay_end=int(args.ds_decay_end),
+        val_full=bool(args.val_full),
+        val_full_max=int(args.val_full_max),
+        val_interval=max(1,int(args.val_interval)),
+        val_overlap_early=float(args.val_overlap_early),
+        val_overlap_late=float(args.val_overlap_late),
+        val_overlap_switch=int(args.val_overlap_switch),
+        val_halo=int(args.val_halo),
+        blend_window=str(args.blend_window),
+        val_rm_small=bool(args.val_rm_small),
+        val_min_cc_vox=int(args.val_min_cc_vox),
+        val_min_cc_rel=float(args.val_min_cc_rel),
+        hd95_start=int(args.hd95_start),
         cldice_ramp_e0=int(args.cldice_ramp_e0),
-        cldice_ramp_e1=int(args.cldice_ramp_e1),
-        ce_w_fg_start=float(args.ce_w_fg_start),
-        ce_w_fg_end=float(args.ce_w_fg_end),
-        ce_ramp_e0=int(args.ce_ramp_e0),
-        ce_ramp_e1=int(args.ce_ramp_e1),
-        alpha=float(args.alpha),
-        beta=float(args.beta),
-        grad_clip=float(args.grad_clip),
     )
 
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
+    (cfg.out_dir / "config.json").write_text(json_dump_safe(asdict(cfg), indent=2))
 
     items = list_cases_from_cache(cfg.cache_dir)
     train_items, val_items = split_train_val(items, val_ratio=0.1, seed=cfg.seed)
 
     train_ds = CachedPatchDataset(
-        train_items, cache_dir=cfg.cache_dir,
-        patch_size=cfg.patch_size, training=True,
-        pos_ratio=cfg.pos_ratio, seed=cfg.seed,
-        ram_cache_items=cfg.ram_cache_items,
-        min_fg_voxels=cfg.min_fg_voxels,
+        train_items, cfg.cache_dir, cfg.sampling_db_dir, cfg.patch_size, True,
+        cfg.pos_ratio, cfg.bg_hard_prob,
+        cfg.seed, cfg.ram_cache_items,
+        cfg.center_jitter_prob, cfg.center_jitter_frac
     )
     val_ds = CachedPatchDataset(
-        val_items, cache_dir=cfg.cache_dir,
-        patch_size=cfg.patch_size, training=False,
-        pos_ratio=0.0, seed=cfg.seed,
-        ram_cache_items=cfg.ram_cache_items,
-        min_fg_voxels=0,
+        val_items, cfg.cache_dir, cfg.sampling_db_dir, cfg.patch_size, False,
+        0.0, 0.0,
+        cfg.seed, cfg.ram_cache_items,
+        0.0, 0.0
+    )
+
+    # epoch_size sampler (replacement): controls #iterations/epoch
+    sampler = torch.utils.data.RandomSampler(
+        train_ds, replacement=True, num_samples=int(cfg.epoch_size * cfg.batch_size)
     )
 
     train_loader = torch.utils.data.DataLoader(
-        train_ds,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
-        pin_memory=True,
-        drop_last=True,
-        persistent_workers=(cfg.num_workers > 0),
-        prefetch_factor=2 if cfg.num_workers > 0 else None,
+        train_ds, batch_size=cfg.batch_size, sampler=sampler, shuffle=False,
+        num_workers=cfg.num_workers, pin_memory=True, drop_last=True,
+        persistent_workers=(cfg.num_workers>0),
+        prefetch_factor=2 if cfg.num_workers>0 else None
     )
     val_loader = torch.utils.data.DataLoader(
-        val_ds,
-        batch_size=1,
-        shuffle=False,
-        num_workers=max(0, cfg.num_workers // 2),
-        pin_memory=True,
-        drop_last=False,
-        persistent_workers=(cfg.num_workers > 0),
-        prefetch_factor=2 if cfg.num_workers > 0 else None,
+        val_ds, batch_size=1, shuffle=False,
+        num_workers=max(0, cfg.num_workers//2), pin_memory=True, drop_last=False,
+        persistent_workers=(cfg.num_workers>0),
+        prefetch_factor=2 if cfg.num_workers>0 else None
     )
 
     model = MambaSnakeUNet3D(
-        in_ch=1,
-        num_classes=cfg.num_classes,
-        base=cfg.base_ch,
-        gn_groups=cfg.gn_groups,
-        mamba_layers=cfg.mamba_layers,
-        mamba_axes=cfg.mamba_axes,
-        snake_stages=cfg.snake_stages,
-        snake_k=cfg.snake_k,
+        in_ch=1, num_classes=2, base=cfg.base_ch, gn_groups=cfg.gn_groups,
+        mamba_layers=cfg.mamba_layers, mamba_axes=list(cfg.mamba_axes),
+        snake_stages=cfg.snake_stages, snake_k=cfg.snake_k,
         checkpoint_bottleneck=cfg.checkpoint_bottleneck,
-        deep_supervision=cfg.deep_supervision,
+        checkpoint_decoder=cfg.checkpoint_decoder,
+        coord_inject_levels=cfg.coord_inject_levels,
     ).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.base_lr, weight_decay=cfg.weight_decay)
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
-    # scaler only for fp16
-    scaler: Optional[torch.amp.GradScaler]
+    scaler = None
     if cfg.amp and cfg.amp_dtype == "fp16":
         scaler = torch.amp.GradScaler("cuda", enabled=True)
-    else:
-        scaler = None
 
-    # init loss with start schedule values
-    loss_obj = TubularLoss(
-        num_classes=cfg.num_classes,
-        w_tversky=cfg.w_tversky,
-        w_dice=cfg.w_dice,
-        w_cldice=cfg.w_cldice_start,
-        w_ce=cfg.w_ce,
-        w_bnd=cfg.w_bnd,
-        alpha=cfg.alpha,
-        beta=cfg.beta,
-        include_background=cfg.include_background_losses,
-        cldice_iters=cfg.cldice_iters_start,
-        ce_weight_fg=cfg.ce_w_fg_start,
-    ).to(device)
+    loss_obj = TubularLoss(ce_weight_fg=50.0).to(device)
 
     total_steps = cfg.epochs * len(train_loader)
     global_step = 0
+    best_score = -1e9
+    history: List[Dict[str,Any]] = []
 
-    best_fg = -1.0
-    history: List[Dict[str, Any]] = []
+    # async validation state
+    import multiprocessing as mp
+    ctx = mp.get_context("spawn")
+    val_proc = None
+    val_queue = None
+    val_ckpt_path = None
+    val_epoch_inflight = None
 
-    for epoch in range(1, cfg.epochs + 1):
-        # update scheduled loss params
-        wcl = linear_schedule(epoch, cfg.cldice_ramp_e0, cfg.cldice_ramp_e1, cfg.w_cldice_start, cfg.w_cldice_end)
-        iters = int(round(linear_schedule(epoch, cfg.cldice_ramp_e0, cfg.cldice_ramp_e1, cfg.cldice_iters_start, cfg.cldice_iters_end)))
-        ce_wfg = linear_schedule(epoch, cfg.ce_ramp_e0, cfg.ce_ramp_e1, cfg.ce_w_fg_start, cfg.ce_w_fg_end)
+    # If val_gpu not visible, disable async full validation safely
+    if cfg.val_full:
+        if cfg.val_gpu < 0 or cfg.val_gpu >= dev_count:
+            print(f"[warn] val_gpu={cfg.val_gpu} invalid for visible device_count={dev_count}. "
+                  f"Disable full-volume validation or set CUDA_VISIBLE_DEVICES properly.", flush=True)
+            cfg.val_full = False
 
-        loss_obj.set_w_cldice(wcl)
-        loss_obj.set_cldice_iters(iters)
-        loss_obj.set_ce_weight_fg(ce_wfg)
+    def try_collect_async_results():
+        nonlocal val_proc, val_queue, val_ckpt_path, val_epoch_inflight, best_score, history
+        if val_proc is None:
+            return
+        if val_proc.is_alive():
+            return
+        # finished
+        try:
+            res = val_queue.get_nowait()
+        except Exception:
+            res = {"epoch_id": val_epoch_inflight, "error": "val worker finished but queue empty"}
+        val_proc.join(timeout=1.0)
+
+        # cleanup inflight ckpt file
+        try:
+            if val_ckpt_path is not None and Path(val_ckpt_path).exists():
+                Path(val_ckpt_path).unlink()
+        except Exception:
+            pass
+
+        # merge into history
+        ep = int(res.get("epoch_id", -1))
+        for r in history:
+            if int(r.get("epoch", -999)) == ep:
+                if "error" in res:
+                    r["val_full_error"] = str(res["error"])
+                else:
+                    r.update({
+                        "val_full_fg_dice": float(res.get("val_full_fg_dice", float("nan"))),
+                        "val_full_fg_cldice": float(res.get("val_full_fg_cldice", float("nan"))),
+                        "val_full_hd95": float(res.get("val_full_hd95", float("nan"))),
+                        "val_full_overlap_used": float(res.get("val_full_overlap_used", float("nan"))),
+                        "val_full_hd95_enabled": bool(res.get("val_full_hd95_enabled", False)),
+                    })
+                # update best on full metrics if present
+                d = r.get("val_full_fg_dice", float("nan"))
+                c = r.get("val_full_fg_cldice", float("nan"))
+                if isinstance(d, float) and not math.isnan(d):
+                    score = cfg.select_w_dice*d + cfg.select_w_cldice*c
+                    if float(score) > best_score:
+                        best_score = float(score)
+                        # save best snapshot from that epoch's "best_candidate.pt" if exists
+                        cand = cfg.out_dir / f"candidate_ep{ep:03d}.pt"
+                        if cand.exists():
+                            torch.save({"epoch": ep, "model": torch.load(cand, map_location="cpu")["model"], "best_score": best_score},
+                                       cfg.out_dir / "best.pt")
+                break
+
+        (cfg.out_dir / "history.json").write_text(json_dump_safe(history, indent=2))
+
+        # clear state
+        val_proc = None
+        val_queue = None
+        val_ckpt_path = None
+        val_epoch_inflight = None
+
+    def maybe_launch_async_full_val(epoch: int, val_items: List[Dict[str,str]]):
+        nonlocal val_proc, val_queue, val_ckpt_path, val_epoch_inflight
+        if not cfg.val_full:
+            return
+        # only every val_interval epochs, also always on epoch 1 and last epoch
+        if not (epoch == 1 or epoch == cfg.epochs or (epoch % cfg.val_interval == 0)):
+            return
+        # if worker still running, do NOT block; skip launching
+        if val_proc is not None and val_proc.is_alive():
+            return
+        # create a dedicated checkpoint for this validation epoch
+        ckpt = cfg.out_dir / f"val_ep{epoch:03d}.pt"
+        torch.save({"epoch": epoch, "model": model.state_dict()}, ckpt)
+
+        payload = {
+            "cfg": json.loads(json_dump_safe(asdict(cfg), indent=0)),
+            "ckpt_path": str(ckpt),
+            "val_items": val_items,
+            "epoch_id": int(epoch),
+        }
+        q = ctx.Queue()
+        p = ctx.Process(target=validate_full_worker, args=(payload, q))
+        p.start()
+
+        val_proc = p
+        val_queue = q
+        val_ckpt_path = str(ckpt)
+        val_epoch_inflight = int(epoch)
+
+    for epoch in range(1, cfg.epochs+1):
+        # if previous async validation finished, merge its results now
+        try_collect_async_results()
+
+        w_focal, w_cl, w_bnd, cl_iters, ce_w = loss_schedule(epoch, cfg.epochs, cfg.cldice_ramp_e0)
+        loss_obj.set_weights(w_focal=w_focal, w_cldice=w_cl, w_bnd=w_bnd, ce_wfg=ce_w, cl_iters=cl_iters)
 
         t0 = time.time()
-        tr_loss, global_step = train_one_epoch(
-            model, train_loader, optimizer, scaler, loss_obj, cfg,
-            epoch=epoch, global_step=global_step, total_steps=total_steps
-        )
-        val_loss, val_fg = validate_patchwise(model, val_loader, loss_obj, cfg)
+        tr_loss, global_step = train_one_epoch(model, train_loader, opt, scaler, loss_obj, cfg, epoch, global_step, total_steps)
+        val_metrics = validate_patchwise(model, val_loader, loss_obj, cfg)
         dt = time.time() - t0
+
+        # Save a candidate snapshot for best selection (lightweight)
+        cand_path = cfg.out_dir / f"candidate_ep{epoch:03d}.pt"
+        torch.save({"epoch": epoch, "model": model.state_dict()}, cand_path)
 
         rec = {
             "epoch": epoch,
             "train_loss": float(tr_loss),
-            "val_loss": float(val_loss),
-            "val_fg_dice": float(val_fg),
             "time_sec": float(dt),
-            "lr": float(optimizer.param_groups[0]["lr"]),
-            "w_cldice": float(wcl),
-            "cldice_iters": int(iters),
-            "ce_weight_fg": float(ce_wfg),
-            "patch_size": list(cfg.patch_size),
-            "snake_stages": sorted(list(cfg.snake_stages)),
-            "mamba_axes": cfg.mamba_axes,
+            "lr": float(opt.param_groups[0]["lr"]),
+            "w_focal": float(w_focal),
+            "w_cldice": float(w_cl),
+            "w_bnd": float(w_bnd),
+            "cldice_iters": int(cl_iters),
+            "ce_weight_fg": float(ce_w),
+            "val_loss": float(val_metrics["val_loss"]),
+            "val_fg_dice": float(val_metrics["val_fg_dice"]),
+            # Full metrics may arrive later (async)
+            "val_full_fg_dice": float("nan"),
+            "val_full_fg_cldice": float("nan"),
+            "val_full_hd95": float("nan"),
         }
         history.append(rec)
         print(json.dumps(rec), flush=True)
+        (cfg.out_dir / "history.json").write_text(json_dump_safe(history, indent=2))
 
-        (cfg.out_dir / "history.json").write_text(json.dumps(history, indent=2))
-        torch.save({"epoch": epoch, "model": model.state_dict()}, cfg.out_dir / "last.pt")
+        # launch async full val if due (returns immediately)
+        maybe_launch_async_full_val(epoch, val_items)
 
-        if val_fg > best_fg:
-            best_fg = val_fg
-            torch.save({"epoch": epoch, "model": model.state_dict(), "best_fg": best_fg}, cfg.out_dir / "best.pt")
+    # final collect
+    for _ in range(30):
+        try_collect_async_results()
+        if val_proc is None:
+            break
+        time.sleep(1.0)
 
-    print(f"Done. Best val_fg_dice={best_fg:.4f} -> {cfg.out_dir/'best.pt'}")
+    print(f"Done. Best score={best_score:.4f} -> {cfg.out_dir/'best.pt'}", flush=True)
 
 
 if __name__ == "__main__":
