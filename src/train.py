@@ -1,9 +1,11 @@
 from __future__ import annotations
+
 import argparse
 import json
 import math
 import os
 import random
+import re
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -15,7 +17,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-
 
 # Optional deps for post-processing/HD95
 try:
@@ -66,13 +67,10 @@ def json_dump_safe(obj: Any, indent: int = 2) -> str:
             return sorted(list(x))
         if isinstance(x, (np.integer, np.floating)):
             return x.item()
-        if isinstance(x, (np.ndarray,)):
+        if isinstance(x, np.ndarray):
             return x.tolist()
         return x
     return json.dumps(obj, indent=indent, default=_conv)
-
-def _now_ms() -> int:
-    return int(time.time() * 1000)
 
 def _resolve_cached_path(uid: str, p: str, cache_dir: Path, kind: str) -> str:
     pp = Path(p)
@@ -84,9 +82,29 @@ def _resolve_cached_path(uid: str, p: str, cache_dir: Path, kind: str) -> str:
         alt = cache_dir / "labels" / f"{uid}.pt"
     return str(alt)
 
+def _uid_base(uid: str) -> str:
+    """
+    Maps augmented uid -> base uid to reuse sampling_db npz.
+    Examples:
+      foo_aug003 -> foo
+      foo__aug003 -> foo
+      foo-aug003 -> foo
+      foo_aug -> foo
+    """
+    m = re.match(r"^(.*?)(?:[_\-]{1,2}aug\d*|_aug\d*|-aug\d*|__aug\d*)$", uid)
+    if m and m.group(1):
+        return m.group(1)
+    m = re.match(r"^(.*?)(?:[_\-]{1,2}aug\d+)$", uid)
+    if m and m.group(1):
+        return m.group(1)
+    m = re.match(r"^(.*?)(?:[_\-]{1,2}aug\d+).*?$", uid)
+    if m and m.group(1):
+        return m.group(1)
+    return uid
+
 
 # -------------------------
-# Cache listing
+# Cache listing + grouped split
 # -------------------------
 def list_cases_from_cache(cache_dir: Path) -> List[Dict[str, str]]:
     cases_json = cache_dir / "cases.json"
@@ -103,16 +121,30 @@ def list_cases_from_cache(cache_dir: Path) -> List[Dict[str, str]]:
         raise RuntimeError("No cached items found.")
     return items
 
-def split_train_val(items: List[Dict[str, str]], val_ratio: float = 0.1, seed: int = 42):
+def split_train_val_grouped(items: List[Dict[str, str]], val_ratio: float = 0.1, seed: int = 42):
+    """
+    Prevent leakage: augmented variants of same base UID must not cross train/val.
+    """
+    groups: Dict[str, List[Dict[str, str]]] = {}
+    for it in items:
+        b = _uid_base(it["uid"])
+        groups.setdefault(b, []).append(it)
+
+    keys = list(groups.keys())
     rng = np.random.default_rng(seed)
-    idx = np.arange(len(items))
-    rng.shuffle(idx)
-    n_val = max(1, int(len(items) * val_ratio))
-    val_idx = set(idx[:n_val].tolist())
-    train = [items[i] for i in range(len(items)) if i not in val_idx]
-    val = [items[i] for i in range(len(items)) if i in val_idx]
+    rng.shuffle(keys)
+
+    n_val = max(1, int(len(keys) * val_ratio))
+    val_keys = set(keys[:n_val])
+
+    train = [it for k in keys if k not in val_keys for it in groups[k]]
+    val   = [it for k in keys if k in val_keys for it in groups[k]]
     return train, val
 
+
+# -------------------------
+# Small LRU RAM cache
+# -------------------------
 class _LRUVolCache:
     def __init__(self, max_items: int = 0):
         self.max_items = int(max_items)
@@ -162,9 +194,9 @@ def _pad_to_min_shape_torch(vol: torch.Tensor, target_dhw: Tuple[int, int, int],
     pad = (pw_before, pw_after, ph_before, ph_after, pd_before, pd_after)
 
     if has_c:
-        return F.pad(vol, pad, mode="constant", value=pad_value)
+        return F.pad(vol, pad, mode="constant", value=float(pad_value))
     else:
-        return F.pad(vol.unsqueeze(0), pad, mode="constant", value=pad_value).squeeze(0)
+        return F.pad(vol.unsqueeze(0), pad, mode="constant", value=float(pad_value)).squeeze(0)
 
 def _crop_around_center_torch(vol: torch.Tensor, center_dhw: Tuple[int, int, int], patch_dhw: Tuple[int, int, int]) -> torch.Tensor:
     if vol.ndim == 3:
@@ -187,19 +219,19 @@ def _crop_around_center_torch(vol: torch.Tensor, center_dhw: Tuple[int, int, int
         return vol[sd:sd + pd, sh:sh + ph, sw:sw + pw]
 
 def _augment_light_cpu(img: torch.Tensor, lab: torch.Tensor, rng: np.random.Generator) -> Tuple[torch.Tensor, torch.Tensor]:
-    # flips + intensity jitter + noise (cheap CPU ops)
-    for axis in (1, 2, 3):  # img dims: C,D,H,W
+    # cheap flips + mild intensity jitter + small noise
+    for axis in (1, 2, 3):  # img: C,D,H,W
         if rng.random() < 0.5:
             img = torch.flip(img, dims=(axis,))
             lab = torch.flip(lab, dims=(axis - 1,))
 
-    if rng.random() < 0.25:
-        scale = float(rng.uniform(0.9, 1.1))
-        shift = float(rng.uniform(-0.05, 0.05))
+    if rng.random() < 0.20:
+        scale = float(rng.uniform(0.95, 1.05))
+        shift = float(rng.uniform(-0.03, 0.03))
         img = torch.clamp(img * scale + shift, 0.0, 1.0)
 
-    if rng.random() < 0.20:
-        noise = torch.from_numpy(rng.normal(0.0, 0.01, size=img.shape).astype(np.float32))
+    if rng.random() < 0.15:
+        noise = torch.from_numpy(rng.normal(0.0, 0.008, size=img.shape).astype(np.float32))
         img = torch.clamp(img + noise, 0.0, 1.0)
 
     return img, lab
@@ -233,6 +265,9 @@ class CachedPatchDataset(torch.utils.data.Dataset):
         ram_cache_items: int,
         center_jitter_prob: float,
         center_jitter_frac: float,
+        online_light_aug: bool = True,
+        prefer_sampling_base_uid: bool = True,
+        val_force_fg: bool = False,
     ):
         self.items = items
         self.cache_dir = Path(cache_dir)
@@ -248,6 +283,11 @@ class CachedPatchDataset(torch.utils.data.Dataset):
 
         self.center_jitter_prob = float(center_jitter_prob) if training else 0.0
         self.center_jitter_frac = float(center_jitter_frac) if training else 0.0
+
+        self.online_light_aug = bool(online_light_aug) if training else False
+        self.prefer_sampling_base_uid = bool(prefer_sampling_base_uid)
+
+        self.val_force_fg = bool(val_force_fg)
 
         self.cache_img = _LRUVolCache(self.ram_cache_items)
         self.cache_lab = _LRUVolCache(self.ram_cache_items)
@@ -265,27 +305,41 @@ class CachedPatchDataset(torch.utils.data.Dataset):
             img = torch.load(img_path2, map_location="cpu")  # [1,D,H,W]
             lab = torch.load(lab_path2, map_location="cpu")  # [D,H,W]
             img = img.float()
+            img = torch.clamp(img, 0.0, 1.0)
             lab = (lab > 0).to(torch.uint8)
             self.cache_img.put(uid, img)
             self.cache_lab.put(uid, lab)
         return img, lab
 
+    def _sampling_uid(self, uid: str) -> str:
+        return _uid_base(uid) if self.prefer_sampling_base_uid else uid
+
     def _load_sampling(self, uid: str) -> Tuple[np.ndarray, np.ndarray]:
         if self.sampling_db_dir is None:
             return np.zeros((0,3), np.int32), np.zeros((0,3), np.int32)
-        cached = self.cache_samp.get(uid)
+
+        suid = self._sampling_uid(uid)
+        cached = self.cache_samp.get(suid)
         if cached is not None:
             return cached
-        p = self.sampling_db_dir / f"{uid}.npz"
+
+        p = self.sampling_db_dir / f"{suid}.npz"
         if not p.exists():
             return np.zeros((0,3), np.int32), np.zeros((0,3), np.int32)
         fg, hard, _ = load_sampling_npz(p)
-        self.cache_samp.put(uid, (fg, hard))
+        self.cache_samp.put(suid, (fg, hard))
         return fg, hard
 
     def _choose_center(self, uid: str, lab: torch.Tensor, rng: np.random.Generator) -> Tuple[int,int,int]:
         D, H, W = lab.shape
+
+        # Validation: pick FG center if possible (stability + relevance)
         if not self.training:
+            if self.val_force_fg:
+                fg_coords, _ = self._load_sampling(uid)
+                if fg_coords.shape[0] > 0:
+                    z,y,x = fg_coords[int(rng.integers(0, fg_coords.shape[0]))]
+                    return (int(z), int(y), int(x))
             return (D//2, H//2, W//2)
 
         want_fg = (rng.random() < self.pos_ratio)
@@ -295,13 +349,12 @@ class CachedPatchDataset(torch.utils.data.Dataset):
             z,y,x = fg_coords[int(rng.integers(0, fg_coords.shape[0]))]
             return (int(z), int(y), int(x))
 
-        # background: prefer anatomical hard negatives
+        # background: prefer hard negatives
         use_hard = (hard_coords.shape[0] > 0) and (rng.random() < self.bg_hard_prob)
         if use_hard:
             z,y,x = hard_coords[int(rng.integers(0, hard_coords.shape[0]))]
             return (int(z), int(y), int(x))
 
-        # fallback passive
         return (int(rng.integers(0, D)), int(rng.integers(0, H)), int(rng.integers(0, W)))
 
     def _jitter_center(self, center: Tuple[int,int,int], vol_shape: Tuple[int,int,int], rng: np.random.Generator) -> Tuple[int,int,int]:
@@ -325,9 +378,12 @@ class CachedPatchDataset(torch.utils.data.Dataset):
         it = self.items[idx]
         uid = it["uid"]
 
-        base = self.seed + idx * 10007
+        # Stable validation; diverse training.
+        wi = torch.utils.data.get_worker_info()
+        wid = wi.id if wi is not None else 0
+        base = (self.seed + 10007 * idx + 1000003 * wid) & 0x7FFFFFFF
         if self.training:
-            base += (_now_ms() % 100000)
+            base = (base + (time.time_ns() & 0x7FFFFFFF)) & 0x7FFFFFFF
         rng = np.random.default_rng(base)
 
         img, lab = self._load_pair(uid, it["image_pt"], it["label_pt"])
@@ -335,12 +391,12 @@ class CachedPatchDataset(torch.utils.data.Dataset):
         lab = _pad_to_min_shape_torch(lab, self.patch_size, pad_value=0)
 
         center = self._choose_center(uid, lab, rng)
-        center = self._jitter_center(center, tuple(lab.shape), rng)
+        center = self._jitter_center(center, tuple(lab.shape), rng) if self.training else center
 
         img_p = _crop_around_center_torch(img, center, self.patch_size)          # [1,pd,ph,pw]
         lab_p = _crop_around_center_torch(lab, center, self.patch_size).long()  # [pd,ph,pw]
 
-        if self.training:
+        if self.online_light_aug:
             img_p, lab_p = _augment_light_cpu(img_p, lab_p, rng=rng)
 
         return {"image": img_p.contiguous(), "label": lab_p.contiguous(), "uid": uid}
@@ -376,7 +432,7 @@ class SoftDiceLoss(nn.Module):
         return 1.0 - dice.mean()
 
 class TverskyLoss(nn.Module):
-    def __init__(self, alpha=0.3, beta=0.7, smooth=1e-5):
+    def __init__(self, alpha=0.25, beta=0.75, smooth=1e-5):
         super().__init__()
         self.alpha=float(alpha); self.beta=float(beta); self.smooth=float(smooth)
 
@@ -415,7 +471,7 @@ def _soft_skel(img: torch.Tensor, iters: int) -> torch.Tensor:
     return torch.nan_to_num(skel, nan=0.0, posinf=0.0, neginf=0.0)
 
 class SoftclDiceLoss(nn.Module):
-    def __init__(self, iters: int = 10, smooth: float = 1e-5):
+    def __init__(self, iters: int = 15, smooth: float = 1e-5):
         super().__init__()
         self.iters=int(iters); self.smooth=float(smooth)
 
@@ -428,9 +484,9 @@ class SoftclDiceLoss(nn.Module):
         sp = _soft_skel(p, self.iters)
         st = _soft_skel(t, self.iters)
         tprec = (sp*t).sum() + self.smooth
-        tprec = tprec / ((sp).sum() + self.smooth)
+        tprec = tprec / (sp.sum() + self.smooth)
         tsens = (st*p).sum() + self.smooth
-        tsens = tsens / ((st).sum() + self.smooth)
+        tsens = tsens / (st.sum() + self.smooth)
         cl = (2*tprec*tsens)/(tprec+tsens+self.smooth)
         cl = torch.nan_to_num(cl, nan=0.0, posinf=0.0, neginf=0.0)
         return 1.0 - cl
@@ -444,7 +500,7 @@ class BoundaryLoss(nn.Module):
         return F.l1_loss(p_edge, t_edge)
 
 class FocalCE(nn.Module):
-    def __init__(self, alpha: float=0.75, gamma: float=2.0):
+    def __init__(self, alpha: float=0.80, gamma: float=2.0):
         super().__init__()
         self.alpha=float(alpha); self.gamma=float(gamma)
 
@@ -454,38 +510,50 @@ class FocalCE(nn.Module):
         tgt = targets.long().unsqueeze(1)
         logpt = torch.gather(logp, dim=1, index=tgt).squeeze(1)
         pt = torch.gather(p, dim=1, index=tgt).squeeze(1)
-        alpha_t = torch.where(targets>0,
-                              torch.tensor(self.alpha, device=logits.device),
-                              torch.tensor(1.0-self.alpha, device=logits.device))
-        loss = -alpha_t * (1.0-pt).clamp_min(0)**self.gamma * logpt
+        alpha_t = torch.where(
+            targets > 0,
+            torch.tensor(self.alpha, device=logits.device),
+            torch.tensor(1.0 - self.alpha, device=logits.device),
+        )
+        loss = -alpha_t * (1.0 - pt).clamp_min(0)**self.gamma * logpt
         return loss.mean()
 
 class TubularLoss(nn.Module):
     def __init__(self, ce_weight_fg: float):
         super().__init__()
-        self.tv = TverskyLoss(0.3,0.7)
+        self.tv = TverskyLoss(0.25, 0.75)
         self.dice = SoftDiceLoss()
-        self.cldice = SoftclDiceLoss(10)
+        self.cldice = SoftclDiceLoss(15)
         self.bnd = BoundaryLoss()
-        self.focal = FocalCE(alpha=0.75, gamma=2.0)
+        self.focal = FocalCE(alpha=0.80, gamma=2.0)
         self.register_buffer("ce_w", torch.tensor([1.0, float(ce_weight_fg)], dtype=torch.float32))
 
-        self.w_tv=0.55; self.w_dice=0.20; self.w_ce=0.15; self.w_bnd=0.10
-        self.w_focal=0.0; self.w_cldice=0.0
+        self.w_tv=0.55
+        self.w_dice=0.15
+        self.w_ce=0.20
+        self.w_bnd=0.08
+        self.w_focal=0.02
+        self.w_cldice=0.15
 
-    def set_weights(self, w_focal: float, w_cldice: float, w_bnd: float, ce_wfg: float, cl_iters: int):
+    def set_weights(self, w_focal: float, w_cldice: float, w_bnd: float, ce_wfg: float, cl_iters: int,
+                    w_tv: Optional[float]=None, w_dice: Optional[float]=None, w_ce: Optional[float]=None):
         self.w_focal=float(w_focal)
         self.w_cldice=float(w_cldice)
         self.w_bnd=float(w_bnd)
+        if w_tv is not None: self.w_tv=float(w_tv)
+        if w_dice is not None: self.w_dice=float(w_dice)
+        if w_ce is not None: self.w_ce=float(w_ce)
         self.ce_w[0]=1.0; self.ce_w[1]=float(ce_wfg)
         self.cldice.set_iters(int(cl_iters))
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         loss = 0.0
-        loss = loss + self.w_tv * self.tv(logits, targets)
+        loss = loss + self.w_tv   * self.tv(logits, targets)
         loss = loss + self.w_dice * self.dice(logits, targets)
+
         if self.w_ce > 0:
             loss = loss + self.w_ce * F.cross_entropy(logits.float(), targets.long(), weight=self.ce_w)
+
         if self.w_focal > 0:
             loss = loss + self.w_focal * self.focal(logits, targets)
 
@@ -500,49 +568,25 @@ class TubularLoss(nn.Module):
 
         return torch.nan_to_num(loss, nan=1.0, posinf=1.0, neginf=1.0)
 
-
-# -------------------------
-# Multi-stage loss schedule (clDice delayed)
-# teach coarse vessels first; ramp clDice after cldice_ramp_e0
-# -------------------------
-def loss_schedule(epoch: int, total_epochs: int, cldice_ramp_e0: int) -> Tuple[float,float,float,int,float]:
+def ft_loss_schedule(epoch: int, total_epochs: int) -> Tuple[float,float,float,int,float]:
     """
-    Returns: (w_focal, w_cldice, w_bnd, cl_iters, ce_wfg_target)
+    A Dice-friendly schedule:
+      - Keep CE high for tiny vessels.
+      - clDice helps continuity but is capped so it doesn't suppress Dice.
+    Returns: (w_focal, w_cldice, w_bnd, cl_iters, ce_wfg)
     """
-    # Stage A: warm start 1..50: Focal+Dice, clDice OFF until cldice_ramp_e0
-    if epoch <= 50:
-        w_focal = 0.25
-        w_bnd = 0.05
-        ce_w = 50.0
-        # clDice delayed
-        if epoch < cldice_ramp_e0:
-            w_cl = 0.0
-            iters = 0
-        else:
-            # gentle start
-            w_cl = 0.05
-            iters = 10
-        return w_focal, w_cl, w_bnd, iters, ce_w
+    if epoch <= 10:
+        return 0.05, 0.12, 0.10, 12, 30.0
 
-    # Stage B: 50..min(200,total): fade focal, ramp clDice+Boundary
-    t = (epoch - 50) / max(1, min(200, total_epochs) - 50)
+    t = (epoch - 10) / max(1, total_epochs - 10)
     t = float(np.clip(t, 0.0, 1.0))
 
-    w_focal = 0.25 * (1.0 - t)
-    w_bnd = 0.05 + t * (0.20 - 0.05)
+    w_focal = 0.05 * (1.0 - t)          # fade out
+    w_bnd   = 0.10 + 0.05 * t           # mild increase
+    w_cl    = 0.12 + 0.13 * t           # cap ~0.25
+    iters   = int(round(12 + 8 * t))    # 12 -> 20
+    ce_w    = 30.0 - 12.0 * t           # 30 -> 18 (don’t go too low)
 
-    # clDice still delayed until cldice_ramp_e0, then ramp to 0.50
-    if epoch < cldice_ramp_e0:
-        w_cl = 0.0
-        iters = 0
-    else:
-        # ramp progress from cldice_ramp_e0..200
-        t2 = (epoch - cldice_ramp_e0) / max(1, min(200, total_epochs) - cldice_ramp_e0)
-        t2 = float(np.clip(t2, 0.0, 1.0))
-        w_cl = 0.05 + t2 * (0.50 - 0.05)
-        iters = int(round(10 + t2*(25-10)))
-
-    ce_w = 50.0 - t*(50.0-5.0)  # ease down
     return w_focal, w_cl, w_bnd, iters, ce_w
 
 def deep_sup_weights(epoch: int, start: int, end: int, w2: float, w3: float, w4: float) -> Tuple[float,float,float]:
@@ -565,35 +609,34 @@ def _gn(ch: int, groups: int = 16) -> nn.GroupNorm:
     return nn.GroupNorm(g, ch)
 
 class ConvBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, gn_groups: int = 16):
+    def __init__(self, in_ch: int, out_ch: int, gn_groups: int = 16, dropout: float = 0.0):
         super().__init__()
         self.conv1 = nn.Conv3d(in_ch, out_ch, 3, padding=1, bias=False)
         self.gn1 = _gn(out_ch, gn_groups)
         self.conv2 = nn.Conv3d(out_ch, out_ch, 3, padding=1, bias=False)
         self.gn2 = _gn(out_ch, gn_groups)
+        self.drop = nn.Dropout3d(p=float(dropout)) if dropout and dropout > 0 else nn.Identity()
 
     def forward(self, x):
         x = F.silu(self.gn1(self.conv1(x)))
+        x = self.drop(x)
         x = F.silu(self.gn2(self.conv2(x)))
         return x
 
 class Down(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, gn_groups: int = 16):
+    def __init__(self, in_ch: int, out_ch: int, gn_groups: int = 16, dropout: float = 0.0):
         super().__init__()
         self.down = nn.Sequential(
             nn.Conv3d(in_ch, out_ch, 2, stride=2, bias=False),
             _gn(out_ch, gn_groups),
             nn.SiLU(),
         )
-        self.block = ConvBlock(out_ch, out_ch, gn_groups)
+        self.block = ConvBlock(out_ch, out_ch, gn_groups, dropout=dropout)
 
     def forward(self, x):
         return self.block(self.down(x))
 
 def _make_base_grid_3d(B: int, D: int, H: int, W: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """
-    Returns grid as (B,3,D,H,W) with channels=(x,y,z) in [-1,1].
-    """
     zz = torch.linspace(-1, 1, D, device=device, dtype=dtype)
     yy = torch.linspace(-1, 1, H, device=device, dtype=dtype)
     xx = torch.linspace(-1, 1, W, device=device, dtype=dtype)
@@ -602,9 +645,6 @@ def _make_base_grid_3d(B: int, D: int, H: int, W: int, device: torch.device, dty
     return grid.unsqueeze(0).repeat(B, 1, 1, 1, 1)  # (B,3,D,H,W)
 
 def _make_grid_for_sample(B: int, D: int, H: int, W: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """
-    Returns grid as (B,D,H,W,3) for grid_sample.
-    """
     g = _make_base_grid_3d(B, D, H, W, device, dtype)  # (B,3,D,H,W)
     return g.permute(0,2,3,4,1).contiguous()          # (B,D,H,W,3)
 
@@ -623,6 +663,9 @@ class CoordInject3D(nn.Module):
         return x + self.proj(g)
 
 class SnakeRefine3DXYZ(nn.Module):
+    """
+    FIXED: positive and negative direction branches now use different offsets.
+    """
     def __init__(self, channels: int, K: int = 3, offset_scale: float = 0.25):
         super().__init__()
         assert K >= 3 and K % 2 == 1
@@ -644,7 +687,7 @@ class SnakeRefine3DXYZ(nn.Module):
         base = _make_grid_for_sample(B,D,H,W,x.device,delta.dtype)  # (B,D,H,W,3)
         grids = [base]
 
-        # positive direction
+        # + direction: offsets 0..half-1
         cum = torch.zeros((B,3,D,H,W), device=x.device, dtype=delta.dtype)
         for s in range(self.half):
             cum = cum + delta[:,:,s]
@@ -654,10 +697,10 @@ class SnakeRefine3DXYZ(nn.Module):
             g[...,2] = g[...,2] + (cum[:,2] * (2.0/max(1,D-1)))
             grids.append(g)
 
-        # negative direction
+        # - direction: offsets half..(K-2)
         cum = torch.zeros((B,3,D,H,W), device=x.device, dtype=delta.dtype)
         for s in range(self.half):
-            cum = cum + delta[:,:,s]
+            cum = cum + delta[:,:,self.half + s]
             g = base.clone()
             g[...,0] = g[...,0] - (cum[:,0] * (2.0/max(1,W-1)))
             g[...,1] = g[...,1] - (cum[:,1] * (2.0/max(1,H-1)))
@@ -670,10 +713,10 @@ class SnakeRefine3DXYZ(nn.Module):
 
 class Up(nn.Module):
     def __init__(self, in_ch: int, skip_ch: int, out_ch: int, use_snake: bool, snake_k: int,
-                 gn_groups: int = 16, checkpoint_block: bool = False):
+                 gn_groups: int = 16, checkpoint_block: bool = False, dropout: float = 0.0):
         super().__init__()
         self.up = nn.ConvTranspose3d(in_ch, out_ch, 2, stride=2, bias=False)
-        self.block = ConvBlock(out_ch + skip_ch, out_ch, gn_groups)
+        self.block = ConvBlock(out_ch + skip_ch, out_ch, gn_groups, dropout=dropout)
         self.snake = SnakeRefine3DXYZ(out_ch, K=snake_k) if use_snake else nn.Identity()
         self.checkpoint_block = bool(checkpoint_block)
 
@@ -702,7 +745,8 @@ def _parse_mamba_axes(s: str) -> List[str]:
     axes=[]
     for t in s.split(","):
         t=t.strip().lower()
-        if not t: continue
+        if not t:
+            continue
         if set(t)!=set("dhw") or len(t)!=3:
             raise ValueError(f"Bad mamba axis order: {t}")
         axes.append(t)
@@ -752,32 +796,34 @@ class MambaSnakeUNet3D(nn.Module):
     def __init__(self, in_ch: int, num_classes: int, base: int, gn_groups: int, mamba_layers: int,
                  mamba_axes: List[str], snake_stages: Iterable[str], snake_k: int,
                  checkpoint_bottleneck: bool, checkpoint_decoder: bool,
-                 coord_inject_levels: str = "bottleneck,enc2,enc3"):
+                 coord_inject_levels: str = "bottleneck,enc2,enc3",
+                 dropout: float = 0.0,
+                 mamba_dropout: float = 0.0):
         super().__init__()
         self.checkpoint_bottleneck = bool(checkpoint_bottleneck)
         self.coord_levels = set([t.strip() for t in coord_inject_levels.split(",") if t.strip()])
 
-        self.stem = ConvBlock(in_ch, base, gn_groups)
+        self.stem = ConvBlock(in_ch, base, gn_groups, dropout=dropout)
         self.c0 = CoordInject3D(base) if "enc0" in self.coord_levels else nn.Identity()
-        self.d1 = Down(base, base*2, gn_groups)
+        self.d1 = Down(base, base*2, gn_groups, dropout=dropout)
         self.c1 = CoordInject3D(base*2) if "enc1" in self.coord_levels else nn.Identity()
-        self.d2 = Down(base*2, base*4, gn_groups)
+        self.d2 = Down(base*2, base*4, gn_groups, dropout=dropout)
         self.c2 = CoordInject3D(base*4) if "enc2" in self.coord_levels else nn.Identity()
-        self.d3 = Down(base*4, base*8, gn_groups)
+        self.d3 = Down(base*4, base*8, gn_groups, dropout=dropout)
         self.c3 = CoordInject3D(base*8) if "enc3" in self.coord_levels else nn.Identity()
-        self.d4 = Down(base*8, base*16, gn_groups)
+        self.d4 = Down(base*8, base*16, gn_groups, dropout=dropout)
 
         bott = base*16
-        self.bpre = ConvBlock(bott, bott, gn_groups)
+        self.bpre = ConvBlock(bott, bott, gn_groups, dropout=dropout)
         self.cb = CoordInject3D(bott) if "bottleneck" in self.coord_levels else nn.Identity()
-        self.mamba = nn.ModuleList([BiMambaSSM(bott, axes=mamba_axes) for _ in range(int(mamba_layers))])
-        self.bpost = ConvBlock(bott, bott, gn_groups)
+        self.mamba = nn.ModuleList([BiMambaSSM(bott, axes=mamba_axes, dropout=mamba_dropout) for _ in range(int(mamba_layers))])
+        self.bpost = ConvBlock(bott, bott, gn_groups, dropout=dropout)
 
         stages = set(snake_stages)
-        self.u4 = Up(bott,    base*8, base*8, use_snake=("u4" in stages), snake_k=snake_k, gn_groups=gn_groups, checkpoint_block=checkpoint_decoder)
-        self.u3 = Up(base*8,  base*4, base*4, use_snake=("u3" in stages), snake_k=snake_k, gn_groups=gn_groups, checkpoint_block=checkpoint_decoder)
-        self.u2 = Up(base*4,  base*2, base*2, use_snake=("u2" in stages), snake_k=snake_k, gn_groups=gn_groups, checkpoint_block=checkpoint_decoder)
-        self.u1 = Up(base*2,  base,   base,   use_snake=("u1" in stages), snake_k=snake_k, gn_groups=gn_groups, checkpoint_block=checkpoint_decoder)
+        self.u4 = Up(bott,    base*8, base*8, use_snake=("u4" in stages), snake_k=snake_k, gn_groups=gn_groups, checkpoint_block=checkpoint_decoder, dropout=dropout)
+        self.u3 = Up(base*8,  base*4, base*4, use_snake=("u3" in stages), snake_k=snake_k, gn_groups=gn_groups, checkpoint_block=checkpoint_decoder, dropout=dropout)
+        self.u2 = Up(base*4,  base*2, base*2, use_snake=("u2" in stages), snake_k=snake_k, gn_groups=gn_groups, checkpoint_block=checkpoint_decoder, dropout=dropout)
+        self.u1 = Up(base*2,  base,   base,   use_snake=("u1" in stages), snake_k=snake_k, gn_groups=gn_groups, checkpoint_block=checkpoint_decoder, dropout=dropout)
 
         self.head = nn.Conv3d(base, num_classes, 1)
         self.aux2 = nn.Conv3d(base*2, num_classes, 1)
@@ -818,7 +864,7 @@ class MambaSnakeUNet3D(nn.Module):
 
 
 # -------------------------
-# GPU geometric augmentation (optional + throttled)
+# GPU geometric augmentation (light)
 # -------------------------
 def gpu_geom_aug(
     img: torch.Tensor,          # [B,1,D,H,W]
@@ -830,16 +876,14 @@ def gpu_geom_aug(
     elastic_coarse: int,
     do_elastic: bool,
 ):
-    assert img.ndim == 5, f"img must be [B,C,D,H,W], got {img.shape}"
     B, C, D, H, W = img.shape
     device = img.device
     dtype_grid = torch.float32
 
     lab_in = lab.unsqueeze(1).float()
-
     grid = _make_grid_for_sample(B, D, H, W, device=device, dtype=dtype_grid)
 
-    # --- Rotation ---
+    # Rotation
     if rot_prob > 0 and torch.rand((), device=device) < rot_prob:
         deg = float(rot_deg)
         ax = (torch.rand((), device=device) * 2 - 1) * deg * (math.pi / 180.0)
@@ -853,13 +897,13 @@ def gpu_geom_aug(
         Rx = torch.tensor([[1,0,0],[0,cx,-sx],[0,sx,cx]], device=device, dtype=dtype_grid)
         Ry = torch.tensor([[cy,0,sy],[0,1,0],[-sy,0,cy]], device=device, dtype=dtype_grid)
         Rz = torch.tensor([[cz,-sz,0],[sz,cz,0],[0,0,1]], device=device, dtype=dtype_grid)
-        R = (Rz @ Ry @ Rx).unsqueeze(0).repeat(B, 1, 1)  # [B,3,3]
+        R = (Rz @ Ry @ Rx).unsqueeze(0).repeat(B, 1, 1)
 
         g = grid.view(B, -1, 3)
         g = torch.bmm(g, R.transpose(1, 2))
         grid = g.view(B, D, H, W, 3)
 
-    # --- Elastic deformation (expensive) ---
+    # Elastic (throttled)
     if do_elastic and elastic_prob > 0 and torch.rand((), device=device) < elastic_prob:
         coarse = int(max(2, elastic_coarse))
         dc = max(2, D // coarse)
@@ -886,7 +930,7 @@ def gpu_geom_aug(
 
 
 # -------------------------
-# Sliding-window inference
+# Sliding-window inference (full-volume val)
 # -------------------------
 _WEIGHT_CACHE: Dict[Tuple[int, int, int, str, str], torch.Tensor] = {}
 
@@ -1039,6 +1083,41 @@ def hd95_binary(pred: np.ndarray, gt: np.ndarray) -> float:
 
 
 # -------------------------
+# EMA
+# -------------------------
+class ModelEMA:
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = float(decay)
+        self.shadow = {}
+        self._init(model)
+
+    def _init(self, model: nn.Module):
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[name] = p.detach().float().clone()
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        d = self.decay
+        for name, p in model.named_parameters():
+            if name in self.shadow:
+                self.shadow[name].mul_(d).add_(p.detach().float(), alpha=(1.0 - d))
+
+    def apply_to(self, model: nn.Module) -> Dict[str, torch.Tensor]:
+        backup = {}
+        for name, p in model.named_parameters():
+            if name in self.shadow:
+                backup[name] = p.detach().clone()
+                p.data.copy_(self.shadow[name].to(p.dtype).to(p.device))
+        return backup
+
+    def restore(self, model: nn.Module, backup: Dict[str, torch.Tensor]):
+        for name, p in model.named_parameters():
+            if name in backup:
+                p.data.copy_(backup[name].to(p.device))
+
+
+# -------------------------
 # Config
 # -------------------------
 @dataclass
@@ -1048,68 +1127,75 @@ class TrainConfig:
     sampling_db_dir: Optional[Path]
 
     gpu: int = 0
-    val_gpu: int = 1
+    val_gpu: int = 0
 
-    epochs: int = 220
-    epoch_size: int = 1024  # iterations per epoch (replacement sampler)
+    epochs: int = 200
+    epoch_size: int = 1024
 
     batch_size: int = 1
     accum_steps: int = 2
     num_workers: int = 8
     seed: int = 42
+    val_ratio: float = 0.10
 
-    patch_size: Tuple[int,int,int] = (160,160,160)
-    val_patch_size: Tuple[int,int,int] = (128,128,128)
+    # A100-friendly default
+    patch_size: Tuple[int,int,int] = (192,192,192)
+    val_patch_size: Tuple[int,int,int] = (192,192,192)
 
-    lr: float = 2e-4
-    weight_decay: float = 1e-2
-    warmup_epochs: int = 10
+    lr: float = 2e-5
+    weight_decay: float = 5e-3
+    warmup_epochs: int = 5
     grad_clip: float = 0.8
 
     amp: bool = True
     amp_dtype: str = "bf16"
 
-    pos_ratio: float = 0.50
-    bg_hard_prob: float = 0.70
+    # sampling
+    pos_ratio: float = 0.70
+    bg_hard_prob: float = 0.85
     ram_cache_items: int = 0
     center_jitter_prob: float = 0.75
     center_jitter_frac: float = 0.30
+    online_light_aug: bool = True
 
-    # GPU geom aug
-    rot_prob: float = 0.10
-    rot_deg: float = 10.0
-    elastic_prob: float = 0.05
-    elastic_alpha: float = 2.0
-    elastic_coarse: int = 5
-    elastic_every: int = 1
+    # GPU geom aug (light)
+    rot_prob: float = 0.05
+    rot_deg: float = 8.0
+    elastic_prob: float = 0.02
+    elastic_alpha: float = 1.5
+    elastic_coarse: int = 6
+    elastic_every: int = 4
 
     # model
     base_ch: int = 32
     gn_groups: int = 16
     mamba_layers: int = 4
     mamba_axes: Tuple[str,...] = ("dhw","hwd","wdh")
-    snake_stages: Tuple[str,...] = ("u3","u2")
+    snake_stages: Tuple[str,...] = ("u3","u2","u1")  # enable u1 by default
     snake_k: int = 3
     checkpoint_bottleneck: bool = True
     checkpoint_decoder: bool = False
     coord_inject_levels: str = "bottleneck,enc2,enc3"
+    dropout: float = 0.0
+    mamba_dropout: float = 0.0
 
     # deep supervision
     ds_w2: float = 0.50
     ds_w3: float = 0.25
     ds_w4: float = 0.125
-    ds_decay_start: int = 150
-    ds_decay_end: int = 220
+    ds_decay_start: int = 80
+    ds_decay_end: int = 200
 
-    # validation scheduling
+    # validation
     val_full: bool = True
-    val_full_max: int = 4
-    val_interval: int = 10
+    val_full_max: int = 16
+    val_interval: int = 5
+    val_async: bool = False
 
-    # dynamic overlap schedule
-    val_overlap_early: float = 0.25
-    val_overlap_late: float = 0.55
-    val_overlap_switch: int = 150
+    # overlap schedule
+    val_overlap_early: float = 0.45
+    val_overlap_late: float = 0.65
+    val_overlap_switch: int = 60
 
     val_halo: int = 16
     blend_window: str = "hann"
@@ -1117,16 +1203,20 @@ class TrainConfig:
     val_min_cc_vox: int = 0
     val_min_cc_rel: float = 0.001
 
-    # HD95 scheduling
-    hd95_start: int = 100
+    # HD95
+    hd95_start: int = 10
 
-    # clDice selection
-    select_w_dice: float = 0.50
-    select_w_cldice: float = 0.50
-    select_cl_iters: int = 20
+    # best selection weights
+    select_w_dice: float = 0.60
+    select_w_cldice: float = 0.40
+    select_cl_iters: int = 25
 
-    # loss schedule
-    cldice_ramp_e0: int = 30
+    # EMA
+    use_ema: bool = True
+    ema_decay: float = 0.999
+
+    # compile
+    compile: bool = False
 
 
 # -------------------------
@@ -1147,10 +1237,10 @@ def _grads_finite(model: nn.Module) -> bool:
 
 
 # -------------------------
-# Train/Val
+# Train / Val
 # -------------------------
 def train_one_epoch(model, loader, optimizer, scaler, loss_obj: TubularLoss, cfg: TrainConfig,
-                    epoch: int, global_step: int, total_steps: int) -> Tuple[float,int]:
+                    epoch: int, global_step: int, total_steps: int, ema: Optional[ModelEMA]=None) -> Tuple[float,int]:
     model.train()
     total=0.0; n=0
     optimizer.zero_grad(set_to_none=True)
@@ -1163,14 +1253,14 @@ def train_one_epoch(model, loader, optimizer, scaler, loss_obj: TubularLoss, cfg
         img = batch["image"].cuda(non_blocking=True)
         lab = batch["label"].cuda(non_blocking=True).long()
 
-        # Throttle elastic augmentation if desired
         do_elastic = (cfg.elastic_every <= 1) or ((global_step % cfg.elastic_every) == 0)
-        img, lab = gpu_geom_aug(
-            img, lab,
-            cfg.rot_prob, cfg.rot_deg,
-            cfg.elastic_prob, cfg.elastic_alpha, cfg.elastic_coarse,
-            do_elastic=do_elastic
-        )
+        if cfg.rot_prob > 0 or cfg.elastic_prob > 0:
+            img, lab = gpu_geom_aug(
+                img, lab,
+                cfg.rot_prob, cfg.rot_deg,
+                cfg.elastic_prob, cfg.elastic_alpha, cfg.elastic_coarse,
+                do_elastic=do_elastic
+            )
 
         lr = cosine_with_warmup(global_step, total_steps, warmup_steps, cfg.lr)
         for pg in optimizer.param_groups:
@@ -1178,8 +1268,7 @@ def train_one_epoch(model, loader, optimizer, scaler, loss_obj: TubularLoss, cfg
 
         with torch.amp.autocast(device_type="cuda", enabled=cfg.amp, dtype=amp_dtype):
             out = model(img)
-            loss_main = loss_obj(out["logits"], lab)
-            loss = loss_main
+            loss = loss_obj(out["logits"], lab)
 
             if w2>0 or w3>0 or w4>0:
                 lab2 = downsample_label_maxpool(lab, factor=2)
@@ -1212,13 +1301,18 @@ def train_one_epoch(model, loader, optimizer, scaler, loss_obj: TubularLoss, cfg
                     scaler.update()
                 global_step += 1
                 continue
+
             if cfg.grad_clip and cfg.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+
             if scaler is not None:
                 scaler.step(optimizer); scaler.update()
             else:
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+
+            if ema is not None:
+                ema.update(model)
 
         total += float(loss.item()) * max(1, cfg.accum_steps)
         n += 1
@@ -1230,7 +1324,7 @@ def train_one_epoch(model, loader, optimizer, scaler, loss_obj: TubularLoss, cfg
 def validate_patchwise(model, loader, loss_obj: TubularLoss, cfg: TrainConfig) -> Dict[str,float]:
     model.eval()
     amp_dtype = _autocast_dtype(cfg.amp_dtype)
-    total=0.0; dfg=0.0; n=0
+    total=0.0; dfg=0.0; cd=0.0; n=0
     for batch in loader:
         img = batch["image"].cuda(non_blocking=True)
         lab = batch["label"].cuda(non_blocking=True).long()
@@ -1239,22 +1333,81 @@ def validate_patchwise(model, loader, loss_obj: TubularLoss, cfg: TrainConfig) -
             loss = loss_obj(out["logits"], lab)
         total += float(loss.item())
         dfg += dice_fg_from_logits(out["logits"], lab)
+        cd  += cldice_from_logits(out["logits"], lab, iters=cfg.select_cl_iters)
         n += 1
-    return {"val_loss": total/max(1,n), "val_fg_dice": dfg/max(1,n)}
+    return {
+        "val_loss": total/max(1,n),
+        "val_fg_dice": dfg/max(1,n),
+        "val_fg_cldice": cd/max(1,n),
+    }
+
+@torch.inference_mode()
+def validate_full_volume(model: nn.Module, val_items: List[Dict[str,str]], cfg: TrainConfig, epoch_id: int) -> Dict[str, Any]:
+    """
+    Full-volume sliding-window validation (sync).
+    Uses a random subset each time for representativeness.
+    """
+    model.eval()
+    amp_dtype = _autocast_dtype(cfg.amp_dtype)
+
+    overlap = cfg.val_overlap_early if epoch_id < cfg.val_overlap_switch else cfg.val_overlap_late
+    compute_hd95 = (epoch_id >= cfg.hd95_start)
+
+    m = min(int(cfg.val_full_max), len(val_items))
+    rng = np.random.default_rng(int(cfg.seed) + 1337 * int(epoch_id))
+    idxs = rng.choice(len(val_items), size=m, replace=False)
+
+    dices=[]; clds=[]; hd95s=[]
+    for ii in idxs:
+        it = val_items[int(ii)]
+        uid = it["uid"]
+        ip = _resolve_cached_path(uid, it["image_pt"], Path(cfg.cache_dir), "image")
+        lp = _resolve_cached_path(uid, it["label_pt"], Path(cfg.cache_dir), "label")
+
+        img = torch.load(ip, map_location="cpu").float()  # [1,D,H,W]
+        lab = torch.load(lp, map_location="cpu")
+        lab = (lab>0).to(torch.uint8)
+
+        img = img.unsqueeze(0).cuda(non_blocking=True)         # [1,1,D,H,W]
+        labt = lab.unsqueeze(0).cuda(non_blocking=True).long() # [1,D,H,W]
+
+        logits = sliding_window_logits(
+            model, img, cfg.val_patch_size, overlap, cfg.val_halo, cfg.blend_window,
+            cfg.amp, amp_dtype
+        )
+
+        dices.append(dice_fg_from_logits(logits, labt))
+        clds.append(cldice_from_logits(logits, labt, iters=cfg.select_cl_iters))
+
+        if compute_hd95:
+            probs = torch.softmax(logits.float(), dim=1)
+            pred = (torch.argmax(probs, dim=1) > 0).detach().cpu().numpy().astype(np.uint8)[0]
+            gt   = (lab.numpy() > 0).astype(np.uint8)
+            if cfg.val_rm_small and _HAS_SCIPY and (cfg.val_min_cc_rel>0 or cfg.val_min_cc_vox>0):
+                pred = remove_small_components_3d(pred, min_vox=cfg.val_min_cc_vox, min_rel=cfg.val_min_cc_rel)
+            hd95s.append(hd95_binary(pred, gt))
+
+        torch.cuda.empty_cache()
+
+    return {
+        "val_full_fg_dice": float(np.mean(dices)) if dices else float("nan"),
+        "val_full_fg_cldice": float(np.mean(clds)) if clds else float("nan"),
+        "val_full_hd95": float(np.mean(hd95s)) if (compute_hd95 and hd95s) else float("nan"),
+        "val_full_overlap_used": float(overlap),
+        "val_full_hd95_enabled": bool(compute_hd95),
+    }
 
 
+# -------------------------
+# Async full-val worker (optional, if you have a separate val GPU)
+# -------------------------
 def validate_full_worker(payload: Dict[str,Any], q):
-    """
-    Spawned worker runs full-volume validation on cfg.val_gpu.
-    Returns dict with metrics + epoch_id.
-    """
     cfgd = payload["cfg"]
     cfg = TrainConfig(**cfgd)
     ckpt_path = Path(payload["ckpt_path"])
-    items = payload["val_items"]
+    val_items = payload["val_items"]
     epoch_id = int(payload["epoch_id"])
 
-    # Device safety
     dev_count = torch.cuda.device_count()
     if int(cfg.val_gpu) < 0 or int(cfg.val_gpu) >= dev_count:
         q.put({"epoch_id": epoch_id, "error": f"val_gpu {cfg.val_gpu} invalid; visible device_count={dev_count}"})
@@ -1271,38 +1424,40 @@ def validate_full_worker(payload: Dict[str,Any], q):
         snake_stages=cfg.snake_stages, snake_k=cfg.snake_k,
         checkpoint_bottleneck=False, checkpoint_decoder=False,
         coord_inject_levels=cfg.coord_inject_levels,
+        dropout=cfg.dropout, mamba_dropout=cfg.mamba_dropout,
     ).to(device)
 
     sd = torch.load(ckpt_path, map_location="cpu")["model"]
     model.load_state_dict(sd, strict=True)
     model.eval()
 
-    # overlap schedule
+    # Full val on val_gpu
     overlap = cfg.val_overlap_early if epoch_id < cfg.val_overlap_switch else cfg.val_overlap_late
     compute_hd95 = (epoch_id >= cfg.hd95_start)
 
+    m = min(int(cfg.val_full_max), len(val_items))
+    rng = np.random.default_rng(int(cfg.seed) + 1337 * int(epoch_id))
+    idxs = rng.choice(len(val_items), size=m, replace=False)
+
     dices=[]; clds=[]; hd95s=[]
-    m = min(int(cfg.val_full_max), len(items))
-    for i in range(m):
-        it = items[i]
+    for ii in idxs:
+        it = val_items[int(ii)]
         uid = it["uid"]
         ip = _resolve_cached_path(uid, it["image_pt"], Path(cfg.cache_dir), "image")
         lp = _resolve_cached_path(uid, it["label_pt"], Path(cfg.cache_dir), "label")
-        img = torch.load(ip, map_location="cpu").float()  # [1,D,H,W]
+
+        img = torch.load(ip, map_location="cpu").float()
         lab = torch.load(lp, map_location="cpu")
         lab = (lab>0).to(torch.uint8)
 
-        img = img.unsqueeze(0).to(device, non_blocking=True)              # [1,1,D,H,W]
-        labt = lab.unsqueeze(0).to(device, non_blocking=True).long()      # [1,D,H,W]
+        img = img.unsqueeze(0).to(device, non_blocking=True)
+        labt = lab.unsqueeze(0).to(device, non_blocking=True).long()
 
-        logits = sliding_window_logits(
-            model, img, cfg.val_patch_size, overlap, cfg.val_halo, cfg.blend_window,
-            cfg.amp, amp_dtype
-        )
+        logits = sliding_window_logits(model, img, cfg.val_patch_size, overlap, cfg.val_halo, cfg.blend_window,
+                                       cfg.amp, amp_dtype)
 
-        d = dice_fg_from_logits(logits, labt)
-        c = cldice_from_logits(logits, labt, iters=cfg.select_cl_iters)
-        dices.append(d); clds.append(c)
+        dices.append(dice_fg_from_logits(logits, labt))
+        clds.append(cldice_from_logits(logits, labt, iters=cfg.select_cl_iters))
 
         if compute_hd95:
             probs = torch.softmax(logits.float(), dim=1)
@@ -1314,15 +1469,14 @@ def validate_full_worker(payload: Dict[str,Any], q):
 
         torch.cuda.empty_cache()
 
-    out = {
+    q.put({
         "epoch_id": epoch_id,
         "val_full_fg_dice": float(np.mean(dices)) if dices else float("nan"),
         "val_full_fg_cldice": float(np.mean(clds)) if clds else float("nan"),
         "val_full_hd95": float(np.mean(hd95s)) if (compute_hd95 and hd95s) else float("nan"),
         "val_full_overlap_used": float(overlap),
         "val_full_hd95_enabled": bool(compute_hd95),
-    }
-    q.put(out)
+    })
 
 
 # -------------------------
@@ -1336,62 +1490,71 @@ def main():
     ap.add_argument("--sampling-db-dir", type=Path, default=None)
 
     ap.add_argument("--gpu", type=int, default=0)
-    ap.add_argument("--val-gpu", type=int, default=1)
+    ap.add_argument("--val-gpu", type=int, default=0)
 
-    ap.add_argument("--epochs", type=int, default=220)
+    ap.add_argument("--epochs", type=int, default=200)
     ap.add_argument("--epoch-size", type=int, default=1024)
 
-    ap.add_argument("--patch-size", type=int, nargs=3, default=[160,160,160])
-    ap.add_argument("--val-patch-size", type=int, nargs=3, default=[128,128,128])
+    ap.add_argument("--patch-size", type=int, nargs=3, default=[192,192,192])
+    ap.add_argument("--val-patch-size", type=int, nargs=3, default=[192,192,192])
 
     ap.add_argument("--batch-size", type=int, default=1)
     ap.add_argument("--accum-steps", type=int, default=2)
     ap.add_argument("--num-workers", type=int, default=8)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--val-ratio", type=float, default=0.10)
 
-    ap.add_argument("--lr", type=float, default=2e-4)
-    ap.add_argument("--weight-decay", type=float, default=1e-2)
-    ap.add_argument("--warmup-epochs", type=int, default=10)
+    ap.add_argument("--lr", type=float, default=2e-5)
+    ap.add_argument("--weight-decay", type=float, default=5e-3)
+    ap.add_argument("--warmup-epochs", type=int, default=5)
     ap.add_argument("--grad-clip", type=float, default=0.8)
 
     ap.add_argument("--amp-dtype", choices=["bf16","fp16"], default="bf16")
     ap.add_argument("--no-amp", action="store_true")
 
-    ap.add_argument("--pos-ratio", type=float, default=0.50)
-    ap.add_argument("--bg-hard-prob", type=float, default=0.70)
+    ap.add_argument("--pos-ratio", type=float, default=0.70)
+    ap.add_argument("--bg-hard-prob", type=float, default=0.85)
 
     ap.add_argument("--ram-cache-items", type=int, default=0)
     ap.add_argument("--center-jitter-prob", type=float, default=0.75)
     ap.add_argument("--center-jitter-frac", type=float, default=0.30)
 
-    ap.add_argument("--rot-prob", type=float, default=0.10)
-    ap.add_argument("--rot-deg", type=float, default=10.0)
-    ap.add_argument("--elastic-prob", type=float, default=0.05)
-    ap.add_argument("--elastic-alpha", type=float, default=2.0)
-    ap.add_argument("--elastic-coarse", type=int, default=5)
-    ap.add_argument("--elastic-every", type=int, default=1)
+    ap.add_argument("--online-light-aug", action="store_true")
+    ap.add_argument("--no-online-light-aug", action="store_true")
+
+    # GPU geom aug
+    ap.add_argument("--rot-prob", type=float, default=0.05)
+    ap.add_argument("--rot-deg", type=float, default=8.0)
+    ap.add_argument("--elastic-prob", type=float, default=0.02)
+    ap.add_argument("--elastic-alpha", type=float, default=1.5)
+    ap.add_argument("--elastic-coarse", type=int, default=6)
+    ap.add_argument("--elastic-every", type=int, default=4)
 
     ap.add_argument("--base-ch", type=int, default=32)
     ap.add_argument("--gn-groups", type=int, default=16)
     ap.add_argument("--mamba-layers", type=int, default=4)
     ap.add_argument("--mamba-axes", type=str, default="dhw,hwd,wdh")
-    ap.add_argument("--snake-stages", type=str, default="u3,u2")
+    ap.add_argument("--snake-stages", type=str, default="u3,u2,u1")
     ap.add_argument("--snake-k", type=int, default=3)
     ap.add_argument("--checkpoint-decoder", action="store_true")
     ap.add_argument("--no-checkpoint-bottleneck", action="store_true")
     ap.add_argument("--coord-inject-levels", type=str, default="bottleneck,enc2,enc3")
+    ap.add_argument("--dropout", type=float, default=0.0)
+    ap.add_argument("--mamba-dropout", type=float, default=0.0)
 
-    ap.add_argument("--ds-decay-start", type=int, default=150)
-    ap.add_argument("--ds-decay-end", type=int, default=220)
+    ap.add_argument("--ds-decay-start", type=int, default=80)
+    ap.add_argument("--ds-decay-end", type=int, default=200)
 
-    # validation scheduling
+    # validation
     ap.add_argument("--val-full", action="store_true")
-    ap.add_argument("--val-full-max", type=int, default=4)
-    ap.add_argument("--val-interval", type=int, default=10)
+    ap.add_argument("--no-val-full", action="store_true")
+    ap.add_argument("--val-full-max", type=int, default=16)
+    ap.add_argument("--val-interval", type=int, default=5)
+    ap.add_argument("--val-async", action="store_true")
 
-    ap.add_argument("--val-overlap-early", type=float, default=0.25)
-    ap.add_argument("--val-overlap-late", type=float, default=0.55)
-    ap.add_argument("--val-overlap-switch", type=int, default=150)
+    ap.add_argument("--val-overlap-early", type=float, default=0.45)
+    ap.add_argument("--val-overlap-late", type=float, default=0.65)
+    ap.add_argument("--val-overlap-switch", type=int, default=60)
 
     ap.add_argument("--val-halo", type=int, default=16)
     ap.add_argument("--blend-window", choices=["hann","gaussian"], default="hann")
@@ -1399,9 +1562,21 @@ def main():
     ap.add_argument("--val-min-cc-vox", type=int, default=0)
     ap.add_argument("--val-min-cc-rel", type=float, default=0.001)
 
-    ap.add_argument("--hd95-start", type=int, default=100)
+    ap.add_argument("--hd95-start", type=int, default=10)
 
-    ap.add_argument("--cldice-ramp-e0", type=int, default=30)
+    ap.add_argument("--select-w-dice", type=float, default=0.60)
+    ap.add_argument("--select-w-cldice", type=float, default=0.40)
+    ap.add_argument("--select-cl-iters", type=int, default=25)
+
+    # EMA
+    ap.add_argument("--use-ema", action="store_true")
+    ap.add_argument("--no-ema", action="store_true")
+    ap.add_argument("--ema-decay", type=float, default=0.999)
+
+    # compile
+    ap.add_argument("--compile", action="store_true")
+
+    ap.add_argument("--init-ckpt", type=Path, required=True)
 
     args = ap.parse_args()
 
@@ -1429,6 +1604,7 @@ def main():
         accum_steps=max(1,int(args.accum_steps)),
         num_workers=int(args.num_workers),
         seed=int(args.seed),
+        val_ratio=float(args.val_ratio),
         patch_size=tuple(int(x) for x in args.patch_size),
         val_patch_size=tuple(int(x) for x in args.val_patch_size),
         lr=float(args.lr),
@@ -1442,6 +1618,7 @@ def main():
         ram_cache_items=int(args.ram_cache_items),
         center_jitter_prob=float(args.center_jitter_prob),
         center_jitter_frac=float(args.center_jitter_frac),
+        online_light_aug=(False if args.no_online_light_aug else True if args.online_light_aug else True),
         rot_prob=float(args.rot_prob),
         rot_deg=float(args.rot_deg),
         elastic_prob=float(args.elastic_prob),
@@ -1457,11 +1634,14 @@ def main():
         checkpoint_bottleneck=(not args.no_checkpoint_bottleneck),
         checkpoint_decoder=bool(args.checkpoint_decoder),
         coord_inject_levels=str(args.coord_inject_levels),
+        dropout=float(args.dropout),
+        mamba_dropout=float(args.mamba_dropout),
         ds_decay_start=int(args.ds_decay_start),
         ds_decay_end=int(args.ds_decay_end),
-        val_full=bool(args.val_full),
+        val_full=(False if args.no_val_full else True if args.val_full else True),
         val_full_max=int(args.val_full_max),
         val_interval=max(1,int(args.val_interval)),
+        val_async=bool(args.val_async),
         val_overlap_early=float(args.val_overlap_early),
         val_overlap_late=float(args.val_overlap_late),
         val_overlap_switch=int(args.val_overlap_switch),
@@ -1471,29 +1651,40 @@ def main():
         val_min_cc_vox=int(args.val_min_cc_vox),
         val_min_cc_rel=float(args.val_min_cc_rel),
         hd95_start=int(args.hd95_start),
-        cldice_ramp_e0=int(args.cldice_ramp_e0),
+        select_w_dice=float(args.select_w_dice),
+        select_w_cldice=float(args.select_w_cldice),
+        select_cl_iters=int(args.select_cl_iters),
+        use_ema=(False if args.no_ema else True if args.use_ema else True),
+        ema_decay=float(args.ema_decay),
+        compile=bool(args.compile),
     )
 
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     (cfg.out_dir / "config.json").write_text(json_dump_safe(asdict(cfg), indent=2))
 
+    # Data
     items = list_cases_from_cache(cfg.cache_dir)
-    train_items, val_items = split_train_val(items, val_ratio=0.1, seed=cfg.seed)
+    train_items, val_items = split_train_val_grouped(items, val_ratio=cfg.val_ratio, seed=cfg.seed)
 
     train_ds = CachedPatchDataset(
         train_items, cfg.cache_dir, cfg.sampling_db_dir, cfg.patch_size, True,
         cfg.pos_ratio, cfg.bg_hard_prob,
         cfg.seed, cfg.ram_cache_items,
-        cfg.center_jitter_prob, cfg.center_jitter_frac
+        cfg.center_jitter_prob, cfg.center_jitter_frac,
+        online_light_aug=cfg.online_light_aug,
+        prefer_sampling_base_uid=True,
+        val_force_fg=False,
     )
     val_ds = CachedPatchDataset(
         val_items, cfg.cache_dir, cfg.sampling_db_dir, cfg.patch_size, False,
         0.0, 0.0,
         cfg.seed, cfg.ram_cache_items,
-        0.0, 0.0
+        0.0, 0.0,
+        online_light_aug=False,
+        prefer_sampling_base_uid=True,
+        val_force_fg=True,   # important
     )
 
-    # epoch_size sampler (replacement): controls #iterations/epoch
     sampler = torch.utils.data.RandomSampler(
         train_ds, replacement=True, num_samples=int(cfg.epoch_size * cfg.batch_size)
     )
@@ -1511,6 +1702,7 @@ def main():
         prefetch_factor=2 if cfg.num_workers>0 else None
     )
 
+    # Model
     model = MambaSnakeUNet3D(
         in_ch=1, num_classes=2, base=cfg.base_ch, gn_groups=cfg.gn_groups,
         mamba_layers=cfg.mamba_layers, mamba_axes=list(cfg.mamba_axes),
@@ -1518,7 +1710,32 @@ def main():
         checkpoint_bottleneck=cfg.checkpoint_bottleneck,
         checkpoint_decoder=cfg.checkpoint_decoder,
         coord_inject_levels=cfg.coord_inject_levels,
+        dropout=cfg.dropout, mamba_dropout=cfg.mamba_dropout,
     ).to(device)
+
+    # Warm-start
+    ckpt_obj = torch.load(args.init_ckpt, map_location="cpu")
+    if isinstance(ckpt_obj, dict) and "model" in ckpt_obj and isinstance(ckpt_obj["model"], dict):
+        state = ckpt_obj["model"]
+    elif isinstance(ckpt_obj, dict) and all(isinstance(k, str) for k in ckpt_obj.keys()):
+        state = ckpt_obj
+    else:
+        raise RuntimeError(f"Unsupported checkpoint format: {type(ckpt_obj)}")
+
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    print(f"[init-ckpt] loaded: {args.init_ckpt}", flush=True)
+    if missing:
+        print(f"[init-ckpt] missing keys: {len(missing)}", flush=True)
+    if unexpected:
+        print(f"[init-ckpt] unexpected keys: {len(unexpected)}", flush=True)
+
+    # Optional torch.compile (A100 usually benefits, but can be brittle)
+    if cfg.compile:
+        try:
+            model = torch.compile(model, mode="max-autotune")
+            print("[info] torch.compile enabled", flush=True)
+        except Exception as e:
+            print(f"[warn] torch.compile failed: {e}", flush=True)
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
@@ -1526,14 +1743,16 @@ def main():
     if cfg.amp and cfg.amp_dtype == "fp16":
         scaler = torch.amp.GradScaler("cuda", enabled=True)
 
-    loss_obj = TubularLoss(ce_weight_fg=50.0).to(device)
+    loss_obj = TubularLoss(ce_weight_fg=30.0).to(device)
+    ema = ModelEMA(model, decay=cfg.ema_decay) if cfg.use_ema else None
 
     total_steps = cfg.epochs * len(train_loader)
     global_step = 0
     best_score = -1e9
+    best_epoch = -1
     history: List[Dict[str,Any]] = []
 
-    # async validation state
+    # async val state
     import multiprocessing as mp
     ctx = mp.get_context("spawn")
     val_proc = None
@@ -1541,81 +1760,66 @@ def main():
     val_ckpt_path = None
     val_epoch_inflight = None
 
-    # If val_gpu not visible, disable async full validation safely
-    if cfg.val_full:
-        if cfg.val_gpu < 0 or cfg.val_gpu >= dev_count:
-            print(f"[warn] val_gpu={cfg.val_gpu} invalid for visible device_count={dev_count}. "
-                  f"Disable full-volume validation or set CUDA_VISIBLE_DEVICES properly.", flush=True)
-            cfg.val_full = False
-
-    def try_collect_async_results():
-        nonlocal val_proc, val_queue, val_ckpt_path, val_epoch_inflight, best_score, history
+    def collect_async_if_ready():
+        nonlocal val_proc, val_queue, val_ckpt_path, val_epoch_inflight, best_score, best_epoch
         if val_proc is None:
-            return
+            return None
         if val_proc.is_alive():
-            return
-        # finished
+            return None
+
         try:
             res = val_queue.get_nowait()
         except Exception:
             res = {"epoch_id": val_epoch_inflight, "error": "val worker finished but queue empty"}
+
         val_proc.join(timeout=1.0)
 
-        # cleanup inflight ckpt file
+        # read snapshot BEFORE deleting
+        snap_model = None
+        if val_ckpt_path is not None and Path(val_ckpt_path).exists():
+            snap_model = torch.load(val_ckpt_path, map_location="cpu")["model"]
+
+        # cleanup snapshot file
         try:
             if val_ckpt_path is not None and Path(val_ckpt_path).exists():
                 Path(val_ckpt_path).unlink()
         except Exception:
             pass
 
-        # merge into history
-        ep = int(res.get("epoch_id", -1))
-        for r in history:
-            if int(r.get("epoch", -999)) == ep:
-                if "error" in res:
-                    r["val_full_error"] = str(res["error"])
-                else:
-                    r.update({
-                        "val_full_fg_dice": float(res.get("val_full_fg_dice", float("nan"))),
-                        "val_full_fg_cldice": float(res.get("val_full_fg_cldice", float("nan"))),
-                        "val_full_hd95": float(res.get("val_full_hd95", float("nan"))),
-                        "val_full_overlap_used": float(res.get("val_full_overlap_used", float("nan"))),
-                        "val_full_hd95_enabled": bool(res.get("val_full_hd95_enabled", False)),
-                    })
-                # update best on full metrics if present
-                d = r.get("val_full_fg_dice", float("nan"))
-                c = r.get("val_full_fg_cldice", float("nan"))
-                if isinstance(d, float) and not math.isnan(d):
-                    score = cfg.select_w_dice*d + cfg.select_w_cldice*c
-                    if float(score) > best_score:
-                        best_score = float(score)
-                        # save best snapshot from that epoch's "best_candidate.pt" if exists
-                        cand = cfg.out_dir / f"candidate_ep{ep:03d}.pt"
-                        if cand.exists():
-                            torch.save({"epoch": ep, "model": torch.load(cand, map_location="cpu")["model"], "best_score": best_score},
-                                       cfg.out_dir / "best.pt")
-                break
-
-        (cfg.out_dir / "history.json").write_text(json_dump_safe(history, indent=2))
-
-        # clear state
         val_proc = None
         val_queue = None
         val_ckpt_path = None
         val_epoch_inflight = None
 
-    def maybe_launch_async_full_val(epoch: int, val_items: List[Dict[str,str]]):
+        if "error" in res:
+            print(f"[val-async-error] {res['error']}", flush=True)
+            return res
+
+        # Update best using full-val
+        d = float(res.get("val_full_fg_dice", float("nan")))
+        c = float(res.get("val_full_fg_cldice", float("nan")))
+        if not (math.isnan(d) or math.isnan(c)):
+            score = cfg.select_w_dice*d + cfg.select_w_cldice*c
+            if score > best_score and snap_model is not None:
+                best_score = score
+                best_epoch = int(res.get("epoch_id", -1))
+                torch.save({"epoch": best_epoch, "model": snap_model, "best_score": best_score}, cfg.out_dir / "best.pt")
+
+        return res
+
+    def launch_async_full_val(epoch: int):
         nonlocal val_proc, val_queue, val_ckpt_path, val_epoch_inflight
-        if not cfg.val_full:
+        if not cfg.val_full or not cfg.val_async:
             return
-        # only every val_interval epochs, also always on epoch 1 and last epoch
+        if cfg.val_gpu == cfg.gpu:
+            return  # async needs a different GPU
         if not (epoch == 1 or epoch == cfg.epochs or (epoch % cfg.val_interval == 0)):
             return
-        # if worker still running, do NOT block; skip launching
         if val_proc is not None and val_proc.is_alive():
             return
-        # create a dedicated checkpoint for this validation epoch
+
         ckpt = cfg.out_dir / f"val_ep{epoch:03d}.pt"
+        # snapshot current model weights
         torch.save({"epoch": epoch, "model": model.state_dict()}, ckpt)
 
         payload = {
@@ -1633,21 +1837,66 @@ def main():
         val_ckpt_path = str(ckpt)
         val_epoch_inflight = int(epoch)
 
+    # Training loop
     for epoch in range(1, cfg.epochs+1):
-        # if previous async validation finished, merge its results now
-        try_collect_async_results()
+        # collect async result if ready
+        async_res = collect_async_if_ready()
+        if async_res is not None:
+            # attach to history
+            ep = int(async_res.get("epoch_id", -1))
+            for r in history:
+                if int(r.get("epoch", -999)) == ep:
+                    if "error" in async_res:
+                        r["val_full_error"] = str(async_res["error"])
+                    else:
+                        r.update({k: async_res[k] for k in async_res.keys() if k != "epoch_id"})
+                    break
+            (cfg.out_dir / "history.json").write_text(json_dump_safe(history, indent=2))
 
-        w_focal, w_cl, w_bnd, cl_iters, ce_w = loss_schedule(epoch, cfg.epochs, cfg.cldice_ramp_e0)
+        # loss schedule
+        w_focal, w_cl, w_bnd, cl_iters, ce_w = ft_loss_schedule(epoch, cfg.epochs)
         loss_obj.set_weights(w_focal=w_focal, w_cldice=w_cl, w_bnd=w_bnd, ce_wfg=ce_w, cl_iters=cl_iters)
 
         t0 = time.time()
-        tr_loss, global_step = train_one_epoch(model, train_loader, opt, scaler, loss_obj, cfg, epoch, global_step, total_steps)
-        val_metrics = validate_patchwise(model, val_loader, loss_obj, cfg)
+        tr_loss, global_step = train_one_epoch(model, train_loader, opt, scaler, loss_obj, cfg, epoch, global_step, total_steps, ema=ema)
         dt = time.time() - t0
 
-        # Save a candidate snapshot for best selection (lightweight)
-        cand_path = cfg.out_dir / f"candidate_ep{epoch:03d}.pt"
-        torch.save({"epoch": epoch, "model": model.state_dict()}, cand_path)
+        # patchwise val on EMA weights (usually better)
+        if ema is not None:
+            backup = ema.apply_to(model)
+            val_metrics = validate_patchwise(model, val_loader, loss_obj, cfg)
+            ema.restore(model, backup)
+        else:
+            val_metrics = validate_patchwise(model, val_loader, loss_obj, cfg)
+
+        # save last
+        torch.save({"epoch": epoch, "model": model.state_dict()}, cfg.out_dir / "last.pt")
+
+        # full-volume val (sync) if not async, and only at interval
+        full_metrics = {"val_full_fg_dice": float("nan"), "val_full_fg_cldice": float("nan"), "val_full_hd95": float("nan")}
+        if cfg.val_full and (not cfg.val_async) and (epoch == 1 or epoch == cfg.epochs or (epoch % cfg.val_interval == 0)):
+            # evaluate EMA weights if enabled
+            if ema is not None:
+                backup = ema.apply_to(model)
+                full_metrics = validate_full_volume(model, val_items, cfg, epoch_id=epoch)
+                ema.restore(model, backup)
+            else:
+                full_metrics = validate_full_volume(model, val_items, cfg, epoch_id=epoch)
+
+        # scoring: prefer full metrics when available
+        d_full = float(full_metrics.get("val_full_fg_dice", float("nan")))
+        c_full = float(full_metrics.get("val_full_fg_cldice", float("nan")))
+        if not (math.isnan(d_full) or math.isnan(c_full)):
+            score = cfg.select_w_dice*d_full + cfg.select_w_cldice*c_full
+            score_source = "full"
+        else:
+            score = cfg.select_w_dice*val_metrics["val_fg_dice"] + cfg.select_w_cldice*val_metrics["val_fg_cldice"]
+            score_source = "patch"
+
+        if score > best_score:
+            best_score = float(score)
+            best_epoch = int(epoch)
+            torch.save({"epoch": best_epoch, "model": model.state_dict(), "best_score": best_score}, cfg.out_dir / "best.pt")
 
         rec = {
             "epoch": epoch,
@@ -1661,26 +1910,29 @@ def main():
             "ce_weight_fg": float(ce_w),
             "val_loss": float(val_metrics["val_loss"]),
             "val_fg_dice": float(val_metrics["val_fg_dice"]),
-            # Full metrics may arrive later (async)
-            "val_full_fg_dice": float("nan"),
-            "val_full_fg_cldice": float("nan"),
-            "val_full_hd95": float("nan"),
+            "val_fg_cldice": float(val_metrics["val_fg_cldice"]),
+            "val_full_fg_dice": float(full_metrics.get("val_full_fg_dice", float("nan"))),
+            "val_full_fg_cldice": float(full_metrics.get("val_full_fg_cldice", float("nan"))),
+            "val_full_hd95": float(full_metrics.get("val_full_hd95", float("nan"))),
+            "best_score": float(best_score),
+            "best_epoch": int(best_epoch),
+            "best_source": score_source,
         }
         history.append(rec)
         print(json.dumps(rec), flush=True)
         (cfg.out_dir / "history.json").write_text(json_dump_safe(history, indent=2))
 
-        # launch async full val if due (returns immediately)
-        maybe_launch_async_full_val(epoch, val_items)
+        # if async enabled and separate val GPU exists, launch it
+        launch_async_full_val(epoch)
 
-    # final collect
-    for _ in range(30):
-        try_collect_async_results()
-        if val_proc is None:
+    # Final async drain
+    for _ in range(60):
+        res = collect_async_if_ready()
+        if res is None:
             break
-        time.sleep(1.0)
+        time.sleep(0.2)
 
-    print(f"Done. Best score={best_score:.4f} -> {cfg.out_dir/'best.pt'}", flush=True)
+    print(f"Done. Best score={best_score:.4f} (epoch {best_epoch}) -> {cfg.out_dir/'best.pt'}", flush=True)
 
 
 if __name__ == "__main__":
