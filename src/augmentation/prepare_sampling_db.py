@@ -86,6 +86,9 @@ def main():
     ap.add_argument("--max-hardneg", type=int, default=400000)
     ap.add_argument("--max-bg-easy", type=int, default=400000)
     ap.add_argument("--max-bg-boundary", type=int, default=400000)
+    ap.add_argument("--max-vessel-boundary", type=int, default=200000)
+    ap.add_argument("--patch-dhw", type=int, nargs=3, default=[64, 192, 192],
+                    help="Patch size used during training — used to find vessel boundary-crossing voxels")
 
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
@@ -157,6 +160,31 @@ def main():
         hardneg = _sample_from_mask(hardneg_mask, args.max_hardneg, rng)
         bg_easy = _sample_from_mask(bg_easy_mask, args.max_bg_easy, rng)
 
+        # vessel_boundary pool: fg voxels where a centered patch would straddle
+        # the vessel's bounding box edge — forces model to learn cross-boundary continuity.
+        # A voxel qualifies if it is fg AND within patch_size/2 of any face of the
+        # fg bounding box (meaning a patch centered there sees vessel entering/exiting).
+        pd, ph, pw = args.patch_dhw
+        fg_coords = np.argwhere(lab_bin.numpy())  # [N,3]
+        if fg_coords.shape[0] > 0:
+            fgz_min, fgy_min, fgx_min = fg_coords.min(axis=0)
+            fgz_max, fgy_max, fgx_max = fg_coords.max(axis=0)
+            D, H, W = lab_bin.shape
+            # a vessel voxel is "boundary-crossing" if centering a patch there
+            # would place the patch edge inside the vessel bbox
+            vb_mask = lab_bin.numpy().copy()  # start with all fg
+            # keep only those within half-patch of any bbox face
+            zz, yy, xx = np.ogrid[:D, :H, :W]
+            near_face = (
+                (zz - fgz_min < pd // 2) | (fgz_max - zz < pd // 2) |
+                (yy - fgy_min < ph // 2) | (fgy_max - yy < ph // 2) |
+                (xx - fgx_min < pw // 2) | (fgx_max - xx < pw // 2)
+            )
+            vb_mask = vb_mask & near_face
+        else:
+            vb_mask = np.zeros(lab_bin.shape, dtype=bool)
+        vessel_boundary = _sample_from_mask(vb_mask, args.max_vessel_boundary, rng)
+
         out = args.out_dir / f"{uid}.npz"
         np.savez_compressed(
             out,
@@ -164,6 +192,7 @@ def main():
             bg_easy=bg_easy,
             bg_boundary=bg_boundary,
             hardneg=hardneg,
+            vessel_boundary=vessel_boundary,
             shape=np.array(lab.shape, dtype=np.int32),
         )
 
@@ -174,6 +203,7 @@ def main():
             "bg_easy_n": int(bg_easy.shape[0]),
             "bg_boundary_n": int(bg_boundary.shape[0]),
             "hardneg_n": int(hardneg.shape[0]),
+            "vessel_boundary_n": int(vessel_boundary.shape[0]),
             "hardneg_thr_q": float(args.intensity_q),
             "hardneg_thr_val": float(thr) if np.isfinite(thr) else None,
         }

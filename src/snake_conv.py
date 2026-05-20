@@ -168,21 +168,33 @@ class SnakeAxisConv3D(nn.Module):
                 grids2.append(g)
         grid = torch.stack(grids2, dim=1)  # (B,k,D,H,W,3)
 
-        # Multi-view dropping (paper’s idea: random dropping templates) :contentReference[oaicite:5]{index=5}
+        # Multi-view dropping (paper’s idea: random dropping templates).
+        # We keep the concat width = C*self.k so self.fuse's weights are
+        # compatible between train and eval; dropped slots are zero-filled
+        # (equivalent to masking those views). :contentReference[oaicite:5]{index=5}
+        k_total = self.k
         if self.training and self.drop_p < 1.0:
-            keep = max(1, int(math.floor(self.k * self.drop_p)))
-            # random subset per batch (cheap, stable)
-            idx = torch.randperm(self.k, device=x.device)[:keep]
-            grid = grid[:, idx, ...]
+            keep = max(1, int(math.floor(k_total * self.drop_p)))
+            idx = torch.randperm(k_total, device=x.device)[:keep]
+            grid_kept = grid[:, idx, ...]
             k_eff = keep
         else:
-            k_eff = grid.shape[1]
+            idx = torch.arange(k_total, device=x.device)
+            grid_kept = grid
+            k_eff = k_total
 
         x_rep = x.repeat_interleave(k_eff, dim=0)                 # (B*k_eff,C,D,H,W)
-        grid_rs = grid.reshape(B * k_eff, D, H, W, 3)             # (B*k_eff,D,H,W,3)
-        samp = F.grid_sample(x_rep, grid_rs, mode="bilinear", padding_mode="border", align_corners=True)
-        samp = samp.reshape(B, k_eff, C, D, H, W).permute(0, 2, 1, 3, 4, 5)  # (B,C,k_eff,D,H,W)
-        samp_cat = samp.reshape(B, C * k_eff, D, H, W)
+        grid_rs = grid_kept.reshape(B * k_eff, D, H, W, 3)        # (B*k_eff,D,H,W,3)
+        samp = F.grid_sample(x_rep, grid_rs, mode="bilinear",
+                             padding_mode="border", align_corners=True)
+        samp = samp.reshape(B, k_eff, C, D, H, W)                 # (B,k_eff,C,D,H,W)
+
+        if k_eff == k_total:
+            samp_full = samp
+        else:
+            samp_full = x.new_zeros(B, k_total, C, D, H, W)
+            samp_full[:, idx] = samp
+        samp_cat = samp_full.permute(0, 2, 1, 3, 4, 5).reshape(B, C * k_total, D, H, W)
 
         out = self.fuse(samp_cat)
         return out

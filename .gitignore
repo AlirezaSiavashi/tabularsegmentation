@@ -19,6 +19,20 @@ data/*.csv
 data/nnUNet*
 AGENTS.md
 
+# NavBrush: large directories (data, checkpoints, results)
+data/
+logs/
+results/
+results_tta*.json
+results_aligned*.json
+
+# Container/system artefacts from wrong cwd
+~/
+.podman_tmp/
+
+# Backup
+src_backup/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
